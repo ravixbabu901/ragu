@@ -2,6 +2,8 @@ FROM python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ca-certificates \
+    gnupg \
     gcc \
     aria2 \
     ffmpeg \
@@ -19,10 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mediainfo \
     && rm -rf /var/lib/apt/lists/*
 
-# Install mkvtoolnix from official repo (Debian bookworm)
+# mkvtoolnix repo (bookworm) — proper keyring (no apt-key)
 RUN mkdir -p /etc/apt/keyrings \
-    && wget -qO /etc/apt/keyrings/mkvtoolnix.gpg https://mkvtoolnix.download/gpg-pub-mks.asc \
-    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/mkvtoolnix.gpg] https://mkvtoolnix.download/debian/ bookworm main" \
+    && wget -qO- https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg \
+       | gpg --dearmor -o /etc/apt/keyrings/mkvtoolnix.gpg \
+    && chmod a+r /etc/apt/keyrings/mkvtoolnix.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/mkvtoolnix.gpg] https://mkvtoolnix.download/debian/ bookworm main" \
        > /etc/apt/sources.list.d/mkvtoolnix.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends mkvtoolnix \
@@ -36,6 +40,6 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
 
 COPY . .
 
-RUN mkdir -p /app/downloads
+RUN mkdir -p /app/logs /app/downloads
 
 CMD ["python", "-m", "userge"]
