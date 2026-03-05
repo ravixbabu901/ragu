@@ -33,6 +33,7 @@ from userge import userge, Message, config, get_collection, pool
 from userge.plugins.misc.download import url_download, tg_download
 from userge.utils import humanbytes, time_formatter, is_url
 from userge.utils.exceptions import ProcessCanceled
+from userge.utils.path_resolver import resolve_download_path
 from .. import gdrive
 
 _CREDS: Optional[OAuth2Credentials] = None
@@ -759,6 +760,12 @@ class Worker(_GDrive):
                 await self._message.err(str(e_e))
                 return
         file_path = dl_loc if dl_loc else self._message.input_str
+        if not dl_loc and not os.path.isabs(file_path) and not is_input_url:
+            try:
+                file_path = resolve_download_path(file_path)
+            except ValueError as v_e:
+                await self._message.err(str(v_e))
+                return
         if not os.path.exists(file_path):
             await self._message.err("invalid file path provided?")
             return

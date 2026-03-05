@@ -11,7 +11,7 @@ from pathlib import Path
 from subprocess import PIPE, Popen
 from requests import get
 from userge.utils import progress, humanbytes
-from userge.plugins.misc.upload.__main__ import upload_path
+from userge.plugins.misc.upload import upload_path
 import aria2p
 from fishhook import hook
 

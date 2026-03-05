@@ -37,10 +37,10 @@ async def ls_(message: Message):
     lines = [f"📂 `{base}`\n"]
     for entry in entries:
         if entry.is_dir():
-            lines.append(f"  📁 {entry.name}/")
+            lines.append(f"  📁 `{entry.name}/`")
         else:
             size = entry.stat().st_size
-            lines.append(f"  📄 {entry.name}  ({_human_size(size)})")
+            lines.append(f"  📄 `{entry.name}`  ({_human_size(size)})")
 
     text = "\n".join(lines)
     if len(text) > 4000:
