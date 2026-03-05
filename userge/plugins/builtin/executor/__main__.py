@@ -476,7 +476,8 @@ class Term:
     async def execute(cls, cmd: str) -> 'Term':
         kwargs = dict(
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
+            stderr=asyncio.subprocess.PIPE,
+            cwd=config.Dynamic.DOWN_PATH)
         if setsid:
             kwargs['preexec_fn'] = setsid
         if sh := which(os.environ.get("USERGE_SHELL", "bash")):

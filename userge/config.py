@@ -47,7 +47,7 @@ IGNORE_VERIFIED_CHATS = True
 
 
 class Dynamic:
-    DOWN_PATH = environ.get("DOWN_PATH", "./downloads")
+    DOWN_PATH = environ.get("DOWN_PATH", "/app/downloads")
 
     MSG_DELETE_TIMEOUT = 120
     EDIT_SLEEP_TIMEOUT = 10

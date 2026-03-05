@@ -15,6 +15,13 @@ from userge.plugins.misc.upload.__main__ import upload_path
 import aria2p
 from fishhook import hook
 
+try:
+    from userge.plugins.custom.status import (
+        register_task, update_task, complete_task, remove_task)
+    _STATUS_AVAILABLE = True
+except Exception:  # pylint: disable=broad-except
+    _STATUS_AVAILABLE = False
+
 LOGS = userge.getLogger(__name__)
 
 def subprocess_run(cmd):
@@ -70,22 +77,35 @@ async def check_metadata(gid):
 
 
 async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # sourcery no-metrics
+    if _STATUS_AVAILABLE:
+        register_task(gid, gid, kind="download")
     complete = False
     while not complete:
         try:
             t_file = aria2p_client.get_download(gid)
         except:
+            if _STATUS_AVAILABLE:
+                remove_task(gid)
             return await message.edit("Download cancelled by user ...")
         complete = t_file.is_complete
         is_file = t_file.seeder
         try:
             if t_file.error_message:
+                if _STATUS_AVAILABLE:
+                    remove_task(gid)
                 await message.err(str(t_file.error_message))
                 LOGS.info(str(t_file.error_message))
                 return
             if not complete and not t_file.error_message:
                 percentage = int(t_file.progress)
                 downloaded = percentage * int(t_file.total_length) / 100
+                if _STATUS_AVAILABLE:
+                    update_task(gid,
+                                name=t_file.name or gid,
+                                speed=t_file.download_speed,
+                                done=int(downloaded),
+                                total=int(t_file.total_length),
+                                eta=t_file.eta_string())
                 prog_str = "Downloading ....\n[{0}{1}] {2}".format(
                     "".join(
                         Config.FINISHED_PROGRESS_STR
@@ -116,6 +136,8 @@ async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # 
                     previous = msg
             else:
                 if complete and not t_file.name.lower().startswith("[metadata]"):
+                    if _STATUS_AVAILABLE:
+                        complete_task(gid)
                     if tg_upload:
                         return await upload_path(message, Path(t_file.name), False)
                     else:
@@ -141,10 +163,10 @@ async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # 
 
 
 
-@userge.on_cmd("adownload", about={
+@userge.on_cmd("dl", about={
     'header': "Download files to server from torrent or magnet using aria2p",
-    'usage': "{tr}adownload [url/magnet | reply to torrent file]",
-    'examples': "{tr}adownload https://speed.hetzner.de/100MB.bin"},
+    'usage': "{tr}dl [url/magnet | reply to torrent file]",
+    'examples': "{tr}dl https://speed.hetzner.de/100MB.bin"},
     check_downpath=True, del_pre=True)
 async def t_url_download(message: Message):
     "Add url Into Queue."
@@ -187,7 +209,7 @@ async def t_url_download(message: Message):
             except Exception as e:
                 return await message.err(str(e))
     else:
-        await message.edit("Reply to torrent file or send cmd with Magnet/URL.\n\nCheck `.help adownload`")
+        await message.edit("Reply to torrent file or send cmd with Magnet/URL.\n\nCheck `.help dl`")
         return
     gid = download.gid
     await message.edit("`Processing......`")
