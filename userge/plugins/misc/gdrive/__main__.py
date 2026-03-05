@@ -231,7 +231,7 @@ class _GDrive:
             file_id = u_file_obj.get("id")
         else:
             media_body = MediaFileUpload(file_path, mimetype=mime_type,
-                                         chunksize=50*1024*1024, resumable=True)
+                                         chunksize=128*1024*1024, resumable=True)
             u_file_obj = self._service.files().create(body=body, media_body=media_body,
                                                       supportsTeamDrives=True)
             c_time = time.time()
