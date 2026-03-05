@@ -13,7 +13,6 @@ from requests import get
 from userge.utils import progress, humanbytes
 from userge.plugins.misc.upload import upload_path
 import aria2p
-from fishhook import hook
 
 try:
     from userge.plugins.custom.status import (

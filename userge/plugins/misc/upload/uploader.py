@@ -21,8 +21,14 @@ except ImportError:
     _STAGGER_AVAILABLE = False
 
 from PIL import Image
-from hachoir.metadata import extractMetadata
-from hachoir.parser import createParser
+
+try:
+    from hachoir.metadata import extractMetadata
+    from hachoir.parser import createParser
+    _HACHOIR_AVAILABLE = True
+except Exception:  # pylint: disable=broad-except
+    _HACHOIR_AVAILABLE = False
+
 from pyrogram.errors import FloodWait
 from pyrogram import enums
 
@@ -127,16 +133,17 @@ async def vid_upload(message: Message, path, del_path: bool = False,
     str_path = str(path)
     thumb = await get_thumb(str_path) if with_thumb else None
     duration = 0
-    metadata = extractMetadata(createParser(str_path))
-    if metadata and metadata.has("duration"):
-        duration = metadata.get("duration").seconds
+    if _HACHOIR_AVAILABLE:
+        metadata = extractMetadata(createParser(str_path))
+        if metadata and metadata.has("duration"):
+            duration = metadata.get("duration").seconds
     sent: Message = await message.client.send_message(
         message.chat.id, f"`Uploading {str_path} as a video ... {extra}`")
     start_t = datetime.now()
     await message.client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
     width = 0
     height = 0
-    if thumb:
+    if thumb and _HACHOIR_AVAILABLE:
         t_m = extractMetadata(createParser(thumb))
         if t_m and t_m.has("width"):
             width = t_m.get("width")
@@ -191,7 +198,7 @@ async def audio_upload(message: Message, path, del_path: bool = False,
                 pass
         if not thumb:
             thumb = await get_thumb(str_path)
-    metadata = extractMetadata(createParser(str_path))
+    metadata = extractMetadata(createParser(str_path)) if _HACHOIR_AVAILABLE else None
     if metadata and metadata.has("title"):
         title = metadata.get("title")
     if metadata and metadata.has("artist"):
@@ -277,10 +284,11 @@ async def get_thumb(path: str = ''):
                     os.remove(thumb_path)
                     thumb_path = new_thumb_path
                 return thumb_path
-        metadata = extractMetadata(createParser(path))
-        if metadata and metadata.has("duration"):
-            return await take_screen_shot(
-                path, metadata.get("duration").seconds)
+        if _HACHOIR_AVAILABLE:
+            metadata = extractMetadata(createParser(path))
+            if metadata and metadata.has("duration"):
+                return await take_screen_shot(
+                    path, metadata.get("duration").seconds)
     if os.path.exists(LOGO_PATH):
         return LOGO_PATH
     return None
