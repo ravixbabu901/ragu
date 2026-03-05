@@ -1,0 +1,12 @@
+dnspython
+motor>=3.3.2
+pyrogram==2.0.106
+tgcrypto
+aiofiles
+pySmartDL
+oauth2client
+google-api-python-client
+httplib2
+aria2p
+fishhook
+requests
