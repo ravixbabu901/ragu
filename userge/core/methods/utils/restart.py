@@ -10,11 +10,21 @@
 
 __all__ = ['Restart']
 
-from loader.userge.api import restart
+import os
+import sys
+
 from userge import logging
 from ...ext import RawClient
 
 _LOG = logging.getLogger(__name__)
+
+
+def _restart(hard: bool = False) -> None:
+    """Restart the current process by re-executing it."""
+    if hard:
+        os.execl(sys.executable, sys.executable, *sys.argv)
+    else:
+        os.kill(os.getpid(), 15)  # SIGTERM
 
 
 class Restart(RawClient):  # pylint: disable=missing-class-docstring
@@ -22,4 +32,4 @@ class Restart(RawClient):  # pylint: disable=missing-class-docstring
     async def restart(hard: bool = False, **_) -> None:
         """ Restart the Userge """
         _LOG.info(f"Restarting Userge [{'HARD' if hard else 'SOFT'}]")
-        restart(hard)
+        _restart(hard)
