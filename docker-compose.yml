@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  ragu:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - config.env
+    volumes:
+      - ./downloads:/app/downloads
