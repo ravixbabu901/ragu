@@ -22,35 +22,49 @@ LOGS = userge.getLogger(__name__)
 
 GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN", "")
 _GOFILE_BASE = "https://api.gofile.io"
+_GOFILE_STATIC_SECRET = "gf2026x"
+_GOFILE_TIME_BUCKET_SECONDS = 3600  # token rotates every hour
 
 
-async def _get_account_token(session: aiohttp.ClientSession) -> str:
-    """Get or create a guest GoFile token (X-Website-Token)."""
-    async with session.post(f"{_GOFILE_BASE}/accounts") as resp:
+def _generate_x_website_token() -> str:
+    """Generate the X-Website-Token using current time bucket and static secret."""
+    time_bucket = str(int(time.time() / _GOFILE_TIME_BUCKET_SECONDS))
+    return hashlib.sha256((time_bucket + _GOFILE_STATIC_SECRET).encode()).hexdigest()
+
+
+async def _get_account_token(session: aiohttp.ClientSession,
+                              x_website_token: str) -> str:
+    """Create a guest GoFile account and return the account token."""
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Origin": "https://gofile.io",
+        "X-Website-Token": x_website_token,
+    }
+    async with session.post(f"{_GOFILE_BASE}/accounts", headers=headers) as resp:
         data = await resp.json()
     if data.get("status") == "ok":
         return data["data"]["token"]
     raise RuntimeError(f"GoFile account creation failed: {data}")
 
 
-async def _get_content_token(session: aiohttp.ClientSession,
-                              content_id: str,
-                              website_token: str) -> dict:
+async def _get_content(session: aiohttp.ClientSession,
+                        content_id: str,
+                        account_token: str,
+                        x_website_token: str) -> dict:
     """Fetch content metadata for a given content ID."""
-    headers = {"Authorization": f"Bearer {website_token}"}
-    url = f"{_GOFILE_BASE}/contents/{content_id}?wt={website_token}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Origin": "https://gofile.io",
+        "Authorization": f"Bearer {account_token}",
+        "X-Website-Token": x_website_token,
+        "X-bl": "true",
+    }
+    url = f"{_GOFILE_BASE}/contents/{content_id}?wt={x_website_token}"
     async with session.get(url, headers=headers) as resp:
         data = await resp.json()
     if data.get("status") != "ok":
         raise RuntimeError(f"GoFile content fetch failed: {data}")
     return data["data"]
-
-
-def _generate_website_token(content_id: str, website_token: str) -> str:
-    """Generate the salted website token required by GoFile CDN."""
-    # GoFile CDN requires: sha256(contentId + "gf@#&" + websiteToken)
-    raw = content_id + "gf@#&" + website_token
-    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 @userge.on_cmd("godl", about={
@@ -76,13 +90,16 @@ async def godl_(message: Message):
 
     try:
         async with aiohttp.ClientSession() as session:
-            # 1. Get a website token (guest account)
-            website_token = await _get_account_token(session)
+            # 1. Generate X-Website-Token from time bucket
+            x_website_token = _generate_x_website_token()
 
-            # 2. Fetch content metadata
-            content = await _get_content_token(session, content_id, website_token)
+            # 2. Create guest account and get account token
+            account_token = await _get_account_token(session, x_website_token)
 
-            # 3. Collect files
+            # 3. Fetch content metadata
+            content = await _get_content(session, content_id, account_token, x_website_token)
+
+            # 4. Collect files
             if content.get("type") == "file":
                 files = {content["name"]: content}
             else:
@@ -98,11 +115,13 @@ async def godl_(message: Message):
             dl_dir = Path(config.Dynamic.DOWN_PATH)
             dl_dir.mkdir(parents=True, exist_ok=True)
 
-            dl_wt = _generate_website_token(content_id, website_token)
-            cookie = f"accountToken={website_token}"
-            headers = {
-                "Cookie": cookie,
-                "Authorization": f"Bearer {website_token}",
+            dl_headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Origin": "https://gofile.io",
+                "Authorization": f"Bearer {account_token}",
+                "X-Website-Token": x_website_token,
+                "X-bl": "true",
+                "Cookie": f"accountToken={account_token}",
             }
 
             for fname, fdata in files.items():
@@ -118,7 +137,7 @@ async def godl_(message: Message):
                 if _STATUS_AVAILABLE:
                     register_task(task_id, fname, kind="download")
 
-                await _download_file(session, link, dest, task_id, size, headers)
+                await _download_file(session, link, dest, task_id, size, dl_headers)
 
                 if _STATUS_AVAILABLE:
                     complete_task(task_id)
@@ -163,7 +182,8 @@ async def _download_file(session: aiohttp.ClientSession,
 @userge.on_cmd("goup", about={
     'header': "Upload a file to GoFile",
     'usage': "{tr}goup <file_path>",
-    'examples': ["{tr}goup /app/downloads/video.mkv"]})
+    'examples': ["{tr}goup /app/downloads/video.mkv",
+                 "{tr}goup video.mkv"]})
 async def goup_(message: Message):
     """ upload a local file to GoFile """
     if not GOFILE_TOKEN:
@@ -184,19 +204,21 @@ async def goup_(message: Message):
         await message.err(f"File not found: `{path_str}`")
         return
 
+    # Preserve the original unencoded filename for display
+    display_name = src.name
     size = src.stat().st_size
-    task_id = f"goup_{src.name}"
-    await message.edit(f"`Uploading to GoFile: {src.name} ({humanbytes(size)})`")
+    task_id = f"goup_{display_name}"
+    await message.edit(f"`Uploading to GoFile: {display_name} ({humanbytes(size)})`")
 
     if _STATUS_AVAILABLE:
-        register_task(task_id, src.name, kind="upload")
+        register_task(task_id, display_name, kind="upload")
 
     try:
         link = await _upload_to_gofile(src, task_id, size)
         if _STATUS_AVAILABLE:
             complete_task(task_id)
         await message.edit(
-            f"✅ Uploaded: `{src.name}`\n"
+            f"✅ Uploaded: `{display_name}`\n"
             f"🔗 Link: {link}"
         )
     except Exception as e:  # pylint: disable=broad-except
@@ -236,6 +258,7 @@ async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
                     yield chunk
 
         form = aiohttp.FormData()
+        # Use the original filename (no URL encoding applied by aiohttp for the name itself)
         form.add_field("file", _file_generator(), filename=src.name,
                        content_type="application/octet-stream")
         async with session.post(upload_url, data=form, headers=headers) as resp:
@@ -248,3 +271,4 @@ async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
     if file_data.get("parentFolder"):
         return f"https://gofile.io/d/{file_data['parentFolder']}"
     return file_data.get("downloadPage", "")
+
