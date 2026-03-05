@@ -10,3 +10,5 @@ httplib2
 aria2p
 fishhook
 requests
+aiohttp>=3.13.3
+psutil
