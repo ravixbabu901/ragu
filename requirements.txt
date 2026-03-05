@@ -12,3 +12,5 @@ fishhook
 requests
 aiohttp>=3.13.3
 psutil
+hachoir
+Pillow>=10.2.0
