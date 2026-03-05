@@ -12,7 +12,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import stagger
+try:
+    import stagger
+    import stagger.id3
+    import stagger.errors as _stagger_errors
+    _STAGGER_AVAILABLE = True
+except ImportError:
+    _STAGGER_AVAILABLE = False
+
 from PIL import Image
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
@@ -21,7 +28,17 @@ from pyrogram import enums
 
 from userge import userge, Message
 from userge.utils import progress, take_screen_shot, humanbytes, sort_file_name_key
-from .. import thumbnail
+
+_thumbnail_mod = None
+try:
+    from .. import thumbnail as _thumbnail_mod  # type: ignore[assignment]
+except ImportError:
+    pass
+
+
+def _thumb_path() -> str:
+    """Return the user-configured thumbnail path, or empty string if unavailable."""
+    return _thumbnail_mod.Dynamic.THUMB_PATH if _thumbnail_mod is not None else ""
 
 CHANNEL = userge.getCLogger(__name__)
 
@@ -161,16 +178,17 @@ async def audio_upload(message: Message, path, del_path: bool = False,
     str_path = str(path)
     file_size = humanbytes(os.stat(str_path).st_size)
     if with_thumb:
-        try:
-            album_art = stagger.read_tag(str_path)
-            if album_art.picture and not os.path.lexists(thumbnail.Dynamic.THUMB_PATH):
-                bytes_pic_data = album_art[stagger.id3.APIC][0].data
-                bytes_io = io.BytesIO(bytes_pic_data)
-                image_file = Image.open(bytes_io)
-                image_file.save("album_cover.jpg", "JPEG")
-                thumb = "album_cover.jpg"
-        except stagger.errors.NoTagError:
-            pass
+        if _STAGGER_AVAILABLE:
+            try:
+                album_art = stagger.read_tag(str_path)
+                if album_art.picture and not os.path.lexists(_thumb_path()):
+                    bytes_pic_data = album_art[stagger.id3.APIC][0].data
+                    bytes_io = io.BytesIO(bytes_pic_data)
+                    image_file = Image.open(bytes_io)
+                    image_file.save("album_cover.jpg", "JPEG")
+                    thumb = "album_cover.jpg"
+            except _stagger_errors.NoTagError:
+                pass
         if not thumb:
             thumb = await get_thumb(str_path)
     metadata = extractMetadata(createParser(str_path))
@@ -242,8 +260,9 @@ async def photo_upload(message: Message, path, del_path: bool = False, extra: st
 
 
 async def get_thumb(path: str = ''):
-    if os.path.exists(thumbnail.Dynamic.THUMB_PATH):
-        return thumbnail.Dynamic.THUMB_PATH
+    thumb_path = _thumb_path()
+    if thumb_path and os.path.exists(thumb_path):
+        return thumb_path
     if path:
         types = (".jpg", ".webp", ".png")
         if path.endswith(types):
@@ -268,8 +287,9 @@ async def get_thumb(path: str = ''):
 
 
 async def remove_thumb(thumb: str) -> None:
+    thumb_path = _thumb_path()
     if (thumb and os.path.exists(thumb)
-            and thumb != LOGO_PATH and thumb != thumbnail.Dynamic.THUMB_PATH):
+            and thumb != LOGO_PATH and thumb != thumb_path):
         os.remove(thumb)
 
 
