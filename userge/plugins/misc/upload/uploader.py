@@ -12,7 +12,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import stagger
+try:
+    import stagger
+    import stagger.id3
+    _STAGGER_AVAILABLE = True
+except Exception:  # pylint: disable=broad-except  # catches ImportError or AttributeError (Python 3.12)
+    _STAGGER_AVAILABLE = False
+
 from PIL import Image
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
@@ -161,16 +167,17 @@ async def audio_upload(message: Message, path, del_path: bool = False,
     str_path = str(path)
     file_size = humanbytes(os.stat(str_path).st_size)
     if with_thumb:
-        try:
-            album_art = stagger.read_tag(str_path)
-            if album_art.picture and not os.path.lexists(thumbnail.Dynamic.THUMB_PATH):
-                bytes_pic_data = album_art[stagger.id3.APIC][0].data
-                bytes_io = io.BytesIO(bytes_pic_data)
-                image_file = Image.open(bytes_io)
-                image_file.save("album_cover.jpg", "JPEG")
-                thumb = "album_cover.jpg"
-        except stagger.errors.NoTagError:
-            pass
+        if _STAGGER_AVAILABLE:
+            try:
+                album_art = stagger.read_tag(str_path)
+                if album_art.picture and not os.path.lexists(thumbnail.Dynamic.THUMB_PATH):
+                    bytes_pic_data = album_art[stagger.id3.APIC][0].data
+                    bytes_io = io.BytesIO(bytes_pic_data)
+                    image_file = Image.open(bytes_io)
+                    image_file.save("album_cover.jpg", "JPEG")
+                    thumb = "album_cover.jpg"
+            except Exception:  # pylint: disable=broad-except
+                pass
         if not thumb:
             thumb = await get_thumb(str_path)
     metadata = extractMetadata(createParser(str_path))
