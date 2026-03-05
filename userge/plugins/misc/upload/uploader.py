@@ -17,7 +17,7 @@ try:
     import stagger.id3
     import stagger.errors as _stagger_errors
     _STAGGER_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError):  # stagger uses collections.MutableMapping (removed in Py3.10)
     _STAGGER_AVAILABLE = False
 
 from PIL import Image
