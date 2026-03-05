@@ -1,16 +1,16 @@
-# uplaoder.py
+# Updated uploader.py
 
-# Lazy import for stagger
-optional_imports = ['stagger']
-try:
-    from userge.plugins.misc.upload import stagger
-except ImportError:
-    stagger = None
+# This import is now handled inside the function.
 
-# Thumbnail fallback
+def audio_upload(...):
+    try:
+        import stagger
+    except ImportError:
+        stagger = None
+    # Rest of the function continues...
 
-def get_thumb():
-    # your existing implementation
-    pass
-
-# Rest of the uploader.py code goes here...
+# Code to skip album art if stagger is missing
+if stagger:
+    # Proceed with album art
+else:
+    # Skip album art
