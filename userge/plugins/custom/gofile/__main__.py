@@ -1,18 +1,26 @@
 """ GoFile download and upload plugin """
 
 import asyncio
+import hashlib
 import math
 import os
 import time
+import urllib.parse
 from pathlib import Path
 
 import aiohttp
-import urllib.parse
 from aiohttp import MultipartWriter
 from aiohttp.payload import BufferedReaderPayload
 
 from userge import userge, Message, config
 from userge.utils import humanbytes, time_formatter
+
+# Reuse the shared aria2p client from the aria plugin
+try:
+    from userge.plugins.custom.aria import aria2p_client
+    _ARIA_AVAILABLE = True
+except Exception:  # pylint: disable=broad-except
+    _ARIA_AVAILABLE = False
 
 try:
     from userge.plugins.custom.status import (
@@ -26,46 +34,97 @@ LOGS = userge.getLogger(__name__)
 GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN", "")
 _GOFILE_BASE = "https://api.gofile.io"
 
+# ------------------------------------------------------------------
+# GoFile 2026 auth helpers
+# ------------------------------------------------------------------
 
-async def _get_account_token(session: aiohttp.ClientSession) -> str:
-    """Create a guest GoFile account and return the account token."""
-    async with session.post(f"{_GOFILE_BASE}/accounts") as resp:
-        data = await resp.json()
-    if data.get("status") == "ok":
-        return data["data"]["token"]
-    raise RuntimeError(f"GoFile account creation failed: {data}")
+_GOFILE_UA = "Mozilla/5.0"
+_GOFILE_LANG = "en-US"
+_GOFILE_STATIC_SECRET = "gf2026x"
 
 
-async def _get_content(session: aiohttp.ClientSession,
-                        content_id: str,
-                        account_token: str) -> dict:
-    """Fetch content metadata for a given content ID."""
-    headers = {
-        "Authorization": f"Bearer {account_token}",
-        "Cookie": f"accountToken={account_token}",
-    }
-    url = f"{_GOFILE_BASE}/contents/{content_id}"
-    async with session.get(url, headers=headers) as resp:
-        data = await resp.json()
+def _generate_x_website_token(bearer_token: str) -> str:
+    """Compute the GoFile X-Website-Token (SHA-256, 4-hour bucket)."""
+    time_bucket = str(math.floor(int(time.time()) / 14400))
+    raw = (
+        f"{_GOFILE_UA}::{_GOFILE_LANG}::{bearer_token}"
+        f"::{time_bucket}::{_GOFILE_STATIC_SECRET}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _gofile_get_download_info(content_id: str) -> tuple:
+    """
+    Returns (account_token, files_dict) where files_dict maps
+    child-key -> child-data for all file-type children (or the
+    single file if the content IS a file).
+    """
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            "User-Agent": _GOFILE_UA,
+            "Origin": "https://gofile.io",
+        }
+
+        # 1. Create guest account
+        async with session.post(
+            f"{_GOFILE_BASE}/accounts", headers=headers, json={}
+        ) as resp:
+            acc_data = await resp.json()
+
+        if acc_data.get("status") != "ok":
+            raise RuntimeError(f"GoFile account creation failed: {acc_data}")
+
+        token = acc_data["data"]["token"]
+
+        # 2. Add auth headers (2026 requirement)
+        headers["Authorization"] = f"Bearer {token}"
+        headers["Cookie"] = f"accountToken={token}"
+        headers["X-Website-Token"] = _generate_x_website_token(token)
+        headers["X-bl"] = _GOFILE_LANG
+
+        # 3. Fetch content metadata
+        async with session.get(
+            f"{_GOFILE_BASE}/contents/{content_id}", headers=headers
+        ) as resp:
+            data = await resp.json()
+
     if data.get("status") != "ok":
         raise RuntimeError(f"GoFile content fetch failed: {data}")
-    return data["data"]
 
+    content = data["data"]
+
+    if content.get("type") == "file":
+        files = {content["name"]: content}
+    else:
+        children = content.get("children", {})
+        files = {k: v for k, v in children.items() if v.get("type") == "file"}
+
+    return token, files
+
+
+# ------------------------------------------------------------------
+# Download command  (.godl)
+# ------------------------------------------------------------------
 
 @userge.on_cmd("godl", about={
-    'header': "Download a file from GoFile",
+    'header': "Download a file from GoFile via aria2",
     'usage': "{tr}godl <gofile_url_or_content_id>",
     'examples': ["{tr}godl https://gofile.io/d/AbCdEf",
                  "{tr}godl AbCdEf"]},
     check_downpath=True)
 async def godl_(message: Message):
     """ download from GoFile """
+    if not _ARIA_AVAILABLE:
+        await message.err(
+            "aria2p client not available. Make sure the aria plugin is loaded.")
+        return
+
     inp = message.input_str.strip() if message.input_str else ""
     if not inp:
         await message.err("Provide a GoFile URL or content ID.")
         return
 
-    # Extract content ID from URL if full URL given
+    # Extract content ID from full URL
     if "gofile.io/d/" in inp:
         content_id = inp.rstrip("/").split("/d/")[-1]
     else:
@@ -74,88 +133,132 @@ async def godl_(message: Message):
     await message.edit(f"`Fetching GoFile content: {content_id} …`")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            # 1. Create guest account and get account token
-            account_token = await _get_account_token(session)
-
-            # 2. Fetch content metadata
-            content = await _get_content(session, content_id, account_token)
-
-            # 3. Collect files
-            if content.get("type") == "file":
-                files = {content["name"]: content}
-            else:
-                files = content.get("children", {})
-                # Filter to only file-type children
-                files = {k: v for k, v in files.items()
-                         if v.get("type") == "file"}
-
-            if not files:
-                await message.err("No downloadable files found.")
-                return
-
-            dl_dir = Path(config.Dynamic.DOWN_PATH)
-            dl_dir.mkdir(parents=True, exist_ok=True)
-
-            dl_headers = {
-                "Authorization": f"Bearer {account_token}",
-                "Cookie": f"accountToken={account_token}",
-            }
-
-            for fname, fdata in files.items():
-                link = fdata.get("link") or fdata.get("directLink")
-                if not link:
-                    continue
-                size = fdata.get("size", 0)
-                dest = dl_dir / fname
-                task_id = f"godl_{fname}"
-
-                await message.edit(f"`Downloading: {fname} ({humanbytes(size)})`")
-
-                if _STATUS_AVAILABLE:
-                    register_task(task_id, fname, kind="download")
-
-                await _download_file(session, link, dest, task_id, size, dl_headers)
-
-                if _STATUS_AVAILABLE:
-                    complete_task(task_id)
-
-                await message.edit(
-                    f"✅ Downloaded: `{fname}`\n"
-                    f"📦 Size: `{humanbytes(size)}`\n"
-                    f"📂 Path: `{dest}`"
-                )
-
+        token, files = await _gofile_get_download_info(content_id)
     except Exception as e:  # pylint: disable=broad-except
         await message.err(str(e))
+        return
+
+    if not files:
+        await message.err("No downloadable files found.")
+        return
+
+    dl_dir = os.path.join("/app", config.Dynamic.DOWN_PATH)
+    os.makedirs(dl_dir, exist_ok=True)
+
+    for fname, fdata in files.items():
+        link = fdata.get("link") or fdata.get("directLink")
+        if not link:
+            LOGS.warning("No link for file %s, skipping.", fname)
+            continue
+
+        await message.edit(f"`Queuing GoFile download: {fname} …`")
+
+        # Add to aria2 with the required auth cookie
+        options = {
+            "dir": dl_dir,
+            "out": fname,
+            "header": [f"Cookie: accountToken={token}"],
+            "max-connection-per-server": "14",
+            "split": "14",
+            "allow-overwrite": "true",
+        }
+
+        try:
+            download = aria2p_client.add_uris([link], options=options)
+        except Exception as e:  # pylint: disable=broad-except
+            await message.err(f"Failed to queue download: {e}")
+            return
+
+        gid = download.gid
+        await message.edit("`Processing…`")
+        await _godl_progress(gid, message, fname)
 
 
-async def _download_file(session: aiohttp.ClientSession,
-                         url: str,
-                         dest: Path,
-                         task_id: str,
-                         total_size: int,
-                         headers: dict) -> None:
-    chunk_size = 1024 * 256  # 256 KB
-    downloaded = 0
-    start = time.time()
+async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
+    """Poll aria2 and display aria-style progress for a GoFile download."""
+    if _STATUS_AVAILABLE:
+        register_task(gid, display_name, kind="download")
 
-    async with session.get(url, headers=headers) as resp:
-        resp.raise_for_status()
-        if total_size == 0:
-            total_size = int(resp.headers.get("Content-Length", 0))
-        with open(dest, "wb") as f:
-            async for chunk in resp.content.iter_chunked(chunk_size):
-                f.write(chunk)
-                downloaded += len(chunk)
-                elapsed = time.time() - start or 0.001
-                speed = int(downloaded / elapsed)
-                if _STATUS_AVAILABLE:
-                    update_task(task_id,
-                                speed=speed,
-                                done=downloaded,
-                                total=total_size)
+    previous = ""
 
+    while True:
+        await asyncio.sleep(config.Dynamic.EDIT_SLEEP_TIMEOUT)
+
+        try:
+            t_file = aria2p_client.get_download(gid)
+        except Exception:  # pylint: disable=broad-except
+            if _STATUS_AVAILABLE:
+                remove_task(gid)
+            await message.edit("Download cancelled by user ...")
+            return
+
+        if t_file.error_message:
+            if _STATUS_AVAILABLE:
+                remove_task(gid)
+            await message.err(str(t_file.error_message))
+            return
+
+        if t_file.is_complete:
+            if _STATUS_AVAILABLE:
+                complete_task(gid)
+            dest = os.path.join(t_file.dir, t_file.name)
+            await message.edit(
+                f"✅ **Downloaded Successfully**\n\n"
+                f"**Name :** `{t_file.name}`\n"
+                f"**Size :** `{t_file.total_length_string()}`\n"
+                f"**Path :** `{dest}`\n"
+                f"**Response :** __Successfully downloaded...__"
+            )
+            return
+
+        # Build aria-style progress message
+        percentage = int(t_file.progress)
+        downloaded = percentage * int(t_file.total_length) / 100
+
+        if _STATUS_AVAILABLE:
+            update_task(
+                gid,
+                name=t_file.name or display_name,
+                speed=t_file.download_speed,
+                done=int(downloaded),
+                total=int(t_file.total_length),
+                eta=t_file.eta_string(),
+            )
+
+        prog_str = "Downloading ....\n[{0}{1}] {2}".format(
+            "".join(
+                config.FINISHED_PROGRESS_STR
+                for _ in range(math.floor(percentage / 10))
+            ),
+            "".join(
+                config.UNFINISHED_PROGRESS_STR
+                for _ in range(10 - math.floor(percentage / 10))
+            ),
+            t_file.progress_string(),
+        )
+
+        # GoFile downloads are HTTP, not torrents — seeder is always None
+        info_msg = f"**Connections**: `{t_file.connections}`\n"
+
+        msg = (
+            f"`{prog_str}`\n"
+            f"**Name**: `{t_file.name or display_name}`\n"
+            f"**Completed**: {humanbytes(downloaded)}\n"
+            f"**Total**: {t_file.total_length_string()}\n"
+            f"**Speed**: {t_file.download_speed_string()} 🔻\n"
+            f"{info_msg}"
+            f"**ETA**: {t_file.eta_string()}\n"
+            f"**GID** : `{gid}`"
+        )
+
+        if msg != previous:
+            await message.edit(msg)
+            previous = msg
+
+
+# ------------------------------------------------------------------
+# Upload command  (.goup)
+# ------------------------------------------------------------------
 
 @userge.on_cmd("goup", about={
     'header': "Upload a file to GoFile",
@@ -176,13 +279,11 @@ async def goup_(message: Message):
 
     src = Path(path_str)
     if not src.is_file():
-        # Try relative to downloads
         src = Path(config.Dynamic.DOWN_PATH) / path_str
     if not src.is_file():
         await message.err(f"File not found: `{path_str}`")
         return
 
-    # Preserve the original unencoded filename for display
     display_name = src.name
     size = src.stat().st_size
     task_id = f"goup_{display_name}"
@@ -192,7 +293,6 @@ async def goup_(message: Message):
     if _STATUS_AVAILABLE:
         register_task(task_id, display_name, kind="upload")
 
-    # Queue for progress strings; sentinel None marks completion/error
     progress_queue: asyncio.Queue = asyncio.Queue()
 
     async def _run_upload():
@@ -215,7 +315,6 @@ async def goup_(message: Message):
                 timeout=config.Dynamic.EDIT_SLEEP_TIMEOUT
             )
         except asyncio.TimeoutError:
-            # No new progress yet; re-display last known progress
             if last_progress:
                 await message.edit(last_progress)
             continue
@@ -283,7 +382,7 @@ class ProgressPayload(BufferedReaderPayload):
     async def write(self, writer):
         chunk_size = 1024 * 256
         while True:
-            chunk = self._value.read(chunk_size)  # _value is the file object in aiohttp payloads
+            chunk = self._value.read(chunk_size)
             if not chunk:
                 break
             await writer.write(chunk)
@@ -308,7 +407,7 @@ async def _upload_to_gofile(src: Path,
 
         sent = 0
         start = time.time()
-        _last_progress_time = [0.0]  # mutable container so closure can update it
+        _last_progress_time = [0.0]
 
         def on_bytes(n: int):
             nonlocal sent
@@ -318,7 +417,6 @@ async def _upload_to_gofile(src: Path,
             speed = sent / elapsed
             eta = int((total_size - sent) / speed) if speed and total_size > sent else 0
 
-            # Throttle progress pushes to avoid flooding the queue
             if now - _last_progress_time[0] >= config.Dynamic.EDIT_SLEEP_TIMEOUT:
                 _last_progress_time[0] = now
                 progress_str = _make_progress_str(
@@ -331,7 +429,7 @@ async def _upload_to_gofile(src: Path,
                 try:
                     progress_queue.put_nowait(("progress", progress_str))
                 except asyncio.QueueFull:
-                    pass  # drop if consumer is lagging
+                    pass
 
             if _STATUS_AVAILABLE:
                 update_task(task_id, speed=int(speed), done=sent, total=total_size)
@@ -346,8 +444,6 @@ async def _upload_to_gofile(src: Path,
                     filename=filename,
                 )
             )
-
-            # match curl -F file=@...
             part.set_content_disposition("form-data", name="file", filename=filename)
             part.headers["Content-Disposition"] += f"; filename*={filename_star}"
 
