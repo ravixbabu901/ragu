@@ -1,4 +1,3 @@
 #!/bin/bash
 
-python -m userge >/dev/null &
-cd /home 
+python -m userge & && cd /home
