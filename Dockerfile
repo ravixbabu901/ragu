@@ -38,7 +38,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-WORKDIR /home
+WORKDIR /app/home
 
 COPY userge ./userge
 
