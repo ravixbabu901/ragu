@@ -20,7 +20,6 @@ import traceback
 from contextlib import contextmanager
 from enum import Enum
 from getpass import getuser
-from shutil import which
 from typing import Awaitable, Any, Callable, Dict, Optional, Tuple, Iterable
 
 import aiofiles
@@ -286,18 +285,13 @@ async def term_(message: Message):
     with message.cancel_callback(t_obj.cancel):
         await t_obj.init()
         while not t_obj.finished:
-            tail = t_obj.tail_lines(30)
-            await message.edit(
-                f"{output}<pre>{tail}</pre>",
-                parse_mode=enums.ParseMode.HTML)
+            await message.edit(f"{output}<pre>{t_obj.line}</pre>", parse_mode=enums.ParseMode.HTML)
             await t_obj.wait(config.Dynamic.EDIT_SLEEP_TIMEOUT)
         if t_obj.cancelled:
             await message.canceled(reply=True)
             return
 
-    ret_code = t_obj.return_code
-    rc_str = f"\n<b>Exit code:</b> <code>{ret_code}</code>" if ret_code is not None else ""
-    out_data = f"{output}<pre>{t_obj.output}</pre>\n{prefix}{rc_str}"
+    out_data = f"{output}<pre>{t_obj.output}</pre>\n{prefix}"
     await message.edit_or_send_as_file(
         out_data, as_raw=as_raw, parse_mode=enums.ParseMode.HTML, filename="term.txt", caption=cmd)
 
@@ -448,10 +442,6 @@ class Term:
     def return_code(self) -> Optional[int]:
         return self._return_code
 
-    def tail_lines(self, n: int) -> str:
-        lines = self._output.decode('utf-8', 'replace').splitlines()
-        return '\n'.join(lines[-n:]).strip()
-
     async def init(self) -> None:
         await self._init.wait()
 
@@ -476,12 +466,9 @@ class Term:
     async def execute(cls, cmd: str) -> 'Term':
         kwargs = dict(
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=config.Dynamic.DOWN_PATH)
+            stderr=asyncio.subprocess.PIPE)
         if setsid:
             kwargs['preexec_fn'] = setsid
-        if sh := which(os.environ.get("USERGE_SHELL", "bash")):
-            kwargs['executable'] = sh
         process = await asyncio.create_subprocess_shell(cmd, **kwargs)
         t_obj = cls(process)
         t_obj._start()

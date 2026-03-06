@@ -1,7 +1,5 @@
 """ GoFile download and upload plugin """
 
-import asyncio
-import hashlib
 import os
 import time
 from pathlib import Path
@@ -22,25 +20,11 @@ LOGS = userge.getLogger(__name__)
 
 GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN", "")
 _GOFILE_BASE = "https://api.gofile.io"
-_GOFILE_STATIC_SECRET = "gf2026x"
-_GOFILE_TIME_BUCKET_SECONDS = 3600  # token rotates every hour
 
 
-def _generate_x_website_token() -> str:
-    """Generate the X-Website-Token using current time bucket and static secret."""
-    time_bucket = str(int(time.time() / _GOFILE_TIME_BUCKET_SECONDS))
-    return hashlib.sha256((time_bucket + _GOFILE_STATIC_SECRET).encode()).hexdigest()
-
-
-async def _get_account_token(session: aiohttp.ClientSession,
-                              x_website_token: str) -> str:
+async def _get_account_token(session: aiohttp.ClientSession) -> str:
     """Create a guest GoFile account and return the account token."""
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Origin": "https://gofile.io",
-        "X-Website-Token": x_website_token,
-    }
-    async with session.post(f"{_GOFILE_BASE}/accounts", headers=headers) as resp:
+    async with session.post(f"{_GOFILE_BASE}/accounts") as resp:
         data = await resp.json()
     if data.get("status") == "ok":
         return data["data"]["token"]
@@ -49,17 +33,13 @@ async def _get_account_token(session: aiohttp.ClientSession,
 
 async def _get_content(session: aiohttp.ClientSession,
                         content_id: str,
-                        account_token: str,
-                        x_website_token: str) -> dict:
+                        account_token: str) -> dict:
     """Fetch content metadata for a given content ID."""
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Origin": "https://gofile.io",
         "Authorization": f"Bearer {account_token}",
-        "X-Website-Token": x_website_token,
-        "X-bl": "true",
+        "Cookie": f"accountToken={account_token}",
     }
-    url = f"{_GOFILE_BASE}/contents/{content_id}?wt={x_website_token}"
+    url = f"{_GOFILE_BASE}/contents/{content_id}"
     async with session.get(url, headers=headers) as resp:
         data = await resp.json()
     if data.get("status") != "ok":
@@ -90,16 +70,13 @@ async def godl_(message: Message):
 
     try:
         async with aiohttp.ClientSession() as session:
-            # 1. Generate X-Website-Token from time bucket
-            x_website_token = _generate_x_website_token()
+            # 1. Create guest account and get account token
+            account_token = await _get_account_token(session)
 
-            # 2. Create guest account and get account token
-            account_token = await _get_account_token(session, x_website_token)
+            # 2. Fetch content metadata
+            content = await _get_content(session, content_id, account_token)
 
-            # 3. Fetch content metadata
-            content = await _get_content(session, content_id, account_token, x_website_token)
-
-            # 4. Collect files
+            # 3. Collect files
             if content.get("type") == "file":
                 files = {content["name"]: content}
             else:
@@ -116,11 +93,7 @@ async def godl_(message: Message):
             dl_dir.mkdir(parents=True, exist_ok=True)
 
             dl_headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Origin": "https://gofile.io",
                 "Authorization": f"Bearer {account_token}",
-                "X-Website-Token": x_website_token,
-                "X-bl": "true",
                 "Cookie": f"accountToken={account_token}",
             }
 
@@ -268,7 +241,36 @@ async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
         raise RuntimeError(f"GoFile upload failed: {result}")
 
     file_data = result["data"]
+
+    # Re-upload (skip) to the same folder with the correct name to fix any
+    # filename encoding issues GoFile may have introduced on the first upload.
+    file_id = file_data.get("fileId") or file_data.get("id")
+    if file_id and GOFILE_TOKEN:
+        await _rename_content(file_id, src.name)
+
     if file_data.get("parentFolder"):
         return f"https://gofile.io/d/{file_data['parentFolder']}"
     return file_data.get("downloadPage", "")
+
+
+async def _rename_content(content_id: str, name: str) -> None:
+    """Rename a GoFile content item to ensure the filename is correct."""
+    url = f"{_GOFILE_BASE}/contents/{content_id}"
+    headers = {
+        "Authorization": f"Bearer {GOFILE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(
+                url,
+                json={"attribute": "name", "attributeValue": name},
+                headers=headers
+            ) as resp:
+                await resp.json()
+    except Exception:  # pylint: disable=broad-except
+        # Rename is best-effort; network errors or GoFile API changes should
+        # not block the upload result from being reported to the user.
+        LOGS.warning("GoFile rename failed for %s (content_id=%s)", name, content_id,
+                     exc_info=True)
 
