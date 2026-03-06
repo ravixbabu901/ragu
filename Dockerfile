@@ -40,8 +40,7 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
 
 COPY . .
 
-RUN mkdir -p /app/logs
+RUN mkdir -p /app/logs /bot
+RUN mv /app /bot
 
-WORKDIR /home
-
-CMD ["bash", "/app/run"]
+CMD ["bash", "/bot/run"]
