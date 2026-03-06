@@ -7,7 +7,7 @@ from pathlib import Path
 import aiohttp
 import urllib.parse
 from aiohttp import MultipartWriter
-from aiohttp.payload import Payload
+from aiohttp.payload import BufferedReaderPayload
 
 from userge import userge, Message, config
 from userge.utils import humanbytes
@@ -203,17 +203,17 @@ async def goup_(message: Message):
         await message.err(str(e))
 
 
-class ProgressPayload(Payload):
-    """File payload wrapper that updates status while uploading."""
+class ProgressPayload(BufferedReaderPayload):
+    """BufferedReaderPayload with upload progress callback."""
+
     def __init__(self, fp, *, callback, content_type, filename):
         super().__init__(fp, content_type=content_type, filename=filename)
-        self._fp = fp
         self._cb = callback
 
     async def write(self, writer):
         chunk_size = 1024 * 256
         while True:
-            chunk = self._fp.read(chunk_size)
+            chunk = self._value.read(chunk_size)  # _value is the file object in aiohttp payloads
             if not chunk:
                 break
             await writer.write(chunk)
