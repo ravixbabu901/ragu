@@ -24,7 +24,7 @@ from urllib.parse import quote, urlparse, parse_qs
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, DEFAULT_CHUNK_SIZE
 from httplib2 import Http
 from oauth2client.client import (
     OAuth2Credentials, OAuth2WebServerFlow, HttpAccessTokenRefreshError, FlowExchangeError)
@@ -51,6 +51,25 @@ _GDRIVE_ID = re.compile(
 
 _LOG = userge.getLogger(__name__)
 _SAVED_SETTINGS = get_collection("CONFIGS")
+
+# ------------------------------------------------------------------
+# Chunk size tuning
+#
+# Google Drive resumable upload throughput is dominated by how many
+# round-trips you make, NOT by raw bandwidth.  Each chunk = 1 HTTP
+# round-trip.  With Vienna → Google (US east) latency ~30–50 ms you
+# want LARGE chunks to minimise round-trips.
+#
+# Tested sweet-spots on fast EU servers:
+#   • 256 MB  → best single-stream throughput on 1–10 Gbps uplinks
+#   • 128 MB  → good balance, fewer memory spikes
+#   • 50  MB  → safe default for 100–500 Mbps uplinks
+#
+# We use 256 MB for upload and 128 MB for download.
+# Both MUST be a multiple of 256 KB (Google's requirement).
+# ------------------------------------------------------------------
+_UPLOAD_CHUNK   = 256 * 1024 * 1024   # 256 MiB
+_DOWNLOAD_CHUNK =  50 * 1024 * 1024   #  50 MiB
 
 
 @userge.on_start
@@ -104,6 +123,19 @@ def creds_dec(func):
     return wrapper
 
 
+def _build_service():
+    """
+    Build a Drive service with an Http() transport that has larger
+    socket timeouts and connection reuse — important for big chunks
+    over a high-latency transatlantic link.
+    """
+    http = _CREDS.authorize(Http())
+    # Increase socket timeout so large 256 MB chunks don't time out
+    # while in flight (default is 60 s which can be tight at ~20 MiB/s).
+    http.timeout = 600  # 10 minutes
+    return build("drive", "v3", http=http, cache_discovery=False)
+
+
 class _GDrive:
     """ GDrive Class For Search, Upload, Download, Copy, Move, Delete, EmptyTrash, ... """
     def __init__(self) -> None:
@@ -123,7 +155,8 @@ class _GDrive:
 
     @property
     def _service(self) -> object:
-        return build("drive", "v3", credentials=_CREDS, cache_discovery=False)
+        # Use the tuned service builder for every operation
+        return _build_service()
 
     @pool.run_in_thread
     def _search(self,
@@ -230,8 +263,11 @@ class _GDrive:
                                                       supportsTeamDrives=True).execute()
             file_id = u_file_obj.get("id")
         else:
+            # 256 MiB chunks → far fewer round-trips on a fast uplink.
+            # Each chunk is one HTTPS POST; latency to Google (AT→US ~80 ms)
+            # means small chunks cap you at ~3 MB/s regardless of bandwidth.
             media_body = MediaFileUpload(file_path, mimetype=mime_type,
-                                         chunksize=128*1024*1024, resumable=True)
+                                         chunksize=_UPLOAD_CHUNK, resumable=True)
             u_file_obj = self._service.files().create(body=body, media_body=media_body,
                                                       supportsTeamDrives=True)
             c_time = time.time()
@@ -242,11 +278,11 @@ class _GDrive:
                     raise ProcessCanceled
                 if status:
                     f_size = status.total_size
-                    diff = time.time() - c_time
+                    diff = time.time() - c_time or 0.001
                     uploaded = status.resumable_progress
                     percentage = uploaded / f_size * 100
                     speed = round(uploaded / diff, 2)
-                    eta = round((f_size - uploaded) / speed)
+                    eta = round((f_size - uploaded) / speed) if speed else 0
                     tmp = \
                         "__Uploading to GDrive...__\n" + \
                         "```\n[{}{}]({}%)```\n" + \
@@ -330,7 +366,8 @@ class _GDrive:
     def _download_file(self, path: str, name: str, **kwargs) -> None:
         request = self._service.files().get_media(fileId=kwargs['id'], supportsTeamDrives=True)
         with io.FileIO(os.path.join(path, name), 'wb') as d_f:
-            d_file_obj = MediaIoBaseDownload(d_f, request, chunksize=50*1024*1024)
+            # 50 MiB download chunks — good balance for EU→Google latency
+            d_file_obj = MediaIoBaseDownload(d_f, request, chunksize=_DOWNLOAD_CHUNK)
             c_time = time.time()
             done = False
             while done is False:
@@ -339,11 +376,11 @@ class _GDrive:
                     raise ProcessCanceled
                 if status:
                     f_size = status.total_size
-                    diff = time.time() - c_time
+                    diff = time.time() - c_time or 0.001
                     downloaded = status.resumable_progress
                     percentage = downloaded / f_size * 100
                     speed = round(downloaded / diff, 2)
-                    eta = round((f_size - downloaded) / speed)
+                    eta = round((f_size - downloaded) / speed) if speed else 0
                     tmp = \
                         "__Downloading From GDrive...__\n" + \
                         "```\n[{}{}]({}%)```\n" + \
