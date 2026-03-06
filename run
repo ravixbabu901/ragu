@@ -1,4 +1,3 @@
 #!/bin/bash
 
-PYTHONPATH="/bot python -m userge"
 python -m userge
