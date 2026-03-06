@@ -22,6 +22,7 @@ from mimetypes import guess_type
 from typing import Optional
 from urllib.parse import quote, urlparse, parse_qs
 
+import requests as _requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -53,12 +54,35 @@ _LOG = userge.getLogger(__name__)
 _SAVED_SETTINGS = get_collection("CONFIGS")
 
 # ------------------------------------------------------------------
-# Chunk sizes — larger chunks = fewer round-trips = faster on high-latency
-# transatlantic links (e.g. Austria → Google US).
-# Must be a multiple of 256 KB per Google's requirement.
+# Chunk sizes
+# 256 MiB upload: fewer round-trips on high-latency transatlantic link
+# 128 MiB download: larger chunks = fewer round-trips for gdown too
+# Both must be multiples of 256 KiB per Google's requirement.
 # ------------------------------------------------------------------
 _UPLOAD_CHUNK   = 256 * 1024 * 1024   # 256 MiB
-_DOWNLOAD_CHUNK =  50 * 1024 * 1024   #  50 MiB
+_DOWNLOAD_CHUNK = 128 * 1024 * 1024   # 128 MiB  (was 50 MiB)
+
+# ------------------------------------------------------------------
+# Reusable requests.Session for direct GDrive downloads.
+# requests has much better TCP buffer tuning than httplib2 and supports
+# persistent keep-alive connections, giving noticeably higher throughput.
+# ------------------------------------------------------------------
+_DL_SESSION: Optional[_requests.Session] = None
+
+
+def _get_dl_session() -> _requests.Session:
+    global _DL_SESSION  # pylint: disable=global-statement
+    if _DL_SESSION is None:
+        s = _requests.Session()
+        adapter = _requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=4,
+            max_retries=3,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _DL_SESSION = s
+    return _DL_SESSION
 
 
 @userge.on_start
@@ -110,6 +134,13 @@ def creds_dec(func):
         else:
             await self._message.edit("Please run `.gsetup` first", del_in=5)  # skipcq: PYL-W0212
     return wrapper
+
+
+def _get_access_token() -> str:
+    """Return a valid OAuth access token, refreshing if needed."""
+    if _CREDS.access_token_expired:
+        _CREDS.refresh(Http())
+    return _CREDS.access_token
 
 
 class _GDrive:
@@ -333,55 +364,76 @@ class _GDrive:
         except ProcessCanceled:
             self._output = "`Process Canceled!`"
         except Exception as e:  # pylint: disable=broad-except
-            # Catch ALL other exceptions — log them and surface via self._output
-            # so the caller shows the real error instead of "failed to upload.. check logs?"
             _LOG.exception("Unexpected error during GDrive upload: %s", e)
             self._output = f"`Upload Error: {type(e).__name__}: {e}`"
         finally:
             self._finish()
 
     def _download_file(self, path: str, name: str, **kwargs) -> None:
-        request = self._service.files().get_media(fileId=kwargs['id'], supportsTeamDrives=True)
-        with io.FileIO(os.path.join(path, name), 'wb') as d_f:
-            d_file_obj = MediaIoBaseDownload(d_f, request, chunksize=_DOWNLOAD_CHUNK)
-            c_time = time.time()
-            done = False
-            while done is False:
-                status, done = d_file_obj.next_chunk(num_retries=5)
-                if self._is_canceled:
-                    raise ProcessCanceled
-                if status:
-                    f_size = status.total_size
-                    diff = time.time() - c_time or 0.001
-                    downloaded = status.resumable_progress
-                    percentage = downloaded / f_size * 100
-                    speed = round(downloaded / diff, 2)
-                    eta = round((f_size - downloaded) / speed) if speed else 0
-                    tmp = \
-                        "__Downloading From GDrive...__\n" + \
-                        "```\n[{}{}]({}%)```\n" + \
-                        "**File Name** : `{}`\n" + \
-                        "**File Size** : `{}`\n" + \
-                        "**Downloaded** : `{}`\n" + \
-                        "**Completed** : `{}/{}`\n" + \
-                        "**Speed** : `{}/s`\n" + \
-                        "**ETA** : `{}`"
-                    self._progress = tmp.format(
-                        "".join((config.FINISHED_PROGRESS_STR
-                                 for _ in range(math.floor(percentage / 5)))),
-                        "".join((config.UNFINISHED_PROGRESS_STR
-                                 for _ in range(20 - math.floor(percentage / 5)))),
-                        round(percentage, 2),
-                        name,
-                        humanbytes(f_size),
-                        humanbytes(downloaded),
-                        self._completed,
-                        self._list,
-                        humanbytes(speed),
-                        time_formatter(eta))
+        """
+        Download using requests directly instead of googleapiclient's
+        MediaIoBaseDownload.  requests has a much better TCP stack than
+        httplib2 and gives 2-3× higher throughput on fast servers.
+        """
+        file_id = kwargs['id']
+        dest = os.path.join(path, name)
+
+        # Get a fresh access token
+        token = _get_access_token()
+        session = _get_dl_session()
+
+        # Use the files.get?alt=media endpoint directly
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsTeamDrives=true"
+        headers = {
+            "Authorization": f"Bearer {token}",
+        }
+
+        chunk_size = _DOWNLOAD_CHUNK
+        c_time = time.time()
+        downloaded = 0
+        f_size = 0
+
+        with session.get(url, headers=headers, stream=True, timeout=600) as resp:
+            resp.raise_for_status()
+            f_size = int(resp.headers.get("Content-Length", 0))
+
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if self._is_canceled:
+                        raise ProcessCanceled
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if f_size > 0:
+                            diff = time.time() - c_time or 0.001
+                            percentage = downloaded / f_size * 100
+                            speed = round(downloaded / diff, 2)
+                            eta = round((f_size - downloaded) / speed) if speed else 0
+                            tmp = \
+                                "__Downloading From GDrive...__\n" + \
+                                "```\n[{}{}]({}%)```\n" + \
+                                "**File Name** : `{}`\n" + \
+                                "**File Size** : `{}`\n" + \
+                                "**Downloaded** : `{}`\n" + \
+                                "**Completed** : `{}/{}`\n" + \
+                                "**Speed** : `{}/s`\n" + \
+                                "**ETA** : `{}`"
+                            self._progress = tmp.format(
+                                "".join((config.FINISHED_PROGRESS_STR
+                                         for _ in range(math.floor(percentage / 5)))),
+                                "".join((config.UNFINISHED_PROGRESS_STR
+                                         for _ in range(20 - math.floor(percentage / 5)))),
+                                round(percentage, 2),
+                                name,
+                                humanbytes(f_size),
+                                humanbytes(downloaded),
+                                self._completed,
+                                self._list,
+                                humanbytes(speed),
+                                time_formatter(eta))
+
         self._completed += 1
-        _LOG.info(
-            "Downloaded Google-Drive File => Name: %s ID: %s", name, kwargs['id'])
+        _LOG.info("Downloaded Google-Drive File => Name: %s ID: %s", name, file_id)
 
     def _list_drive_dir(self, file_id: str) -> list:
         query = f"'{file_id}' in parents and (name contains '*')"
