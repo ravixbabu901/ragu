@@ -1,5 +1,4 @@
 #!/bin/bash
 
-python -m userge &
-sleep 20
-cd /home
+cd /app
+python -m userge
