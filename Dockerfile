@@ -42,4 +42,4 @@ COPY . .
 
 RUN mkdir -p /app/logs /app/downloads
 
-CMD ["python", "-m", "userge", "&", "cd", "/home"]
+CMD ["bash", "run"]
