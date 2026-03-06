@@ -1,4 +1,4 @@
 #!/bin/bash
 
-python -m userge &
 cd /home
+python -m /app/userge
