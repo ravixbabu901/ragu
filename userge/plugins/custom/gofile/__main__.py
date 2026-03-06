@@ -1,5 +1,7 @@
 """ GoFile download and upload plugin """
 
+import asyncio
+import math
 import os
 import time
 from pathlib import Path
@@ -10,7 +12,7 @@ from aiohttp import MultipartWriter
 from aiohttp.payload import BufferedReaderPayload
 
 from userge import userge, Message, config
-from userge.utils import humanbytes
+from userge.utils import humanbytes, time_formatter
 
 try:
     from userge.plugins.custom.status import (
@@ -184,23 +186,91 @@ async def goup_(message: Message):
     display_name = src.name
     size = src.stat().st_size
     task_id = f"goup_{display_name}"
-    await message.edit(f"`Uploading to GoFile: {display_name} ({humanbytes(size)})`")
+
+    await message.edit(f"`Starting GoFile upload: {display_name} ({humanbytes(size)})`")
 
     if _STATUS_AVAILABLE:
         register_task(task_id, display_name, kind="upload")
 
-    try:
-        link = await _upload_to_gofile(src, task_id, size)
-        if _STATUS_AVAILABLE:
-            complete_task(task_id)
-        await message.edit(
-            f"✅ Uploaded: `{display_name}`\n"
-            f"🔗 Link: {link}"
-        )
-    except Exception as e:  # pylint: disable=broad-except
+    # Queue for progress strings; sentinel None marks completion/error
+    progress_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _run_upload():
+        try:
+            link = await _upload_to_gofile(src, task_id, size, progress_queue)
+            await progress_queue.put(("done", link))
+        except Exception as exc:  # pylint: disable=broad-except
+            await progress_queue.put(("error", str(exc)))
+
+    asyncio.ensure_future(_run_upload())
+
+    last_progress = None
+    result_link = None
+    error_msg = None
+
+    while True:
+        try:
+            item = await asyncio.wait_for(
+                progress_queue.get(),
+                timeout=config.Dynamic.EDIT_SLEEP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            # No new progress yet; re-display last known progress
+            if last_progress:
+                await message.edit(last_progress)
+            continue
+
+        kind, payload = item
+
+        if kind == "done":
+            result_link = payload
+            break
+        elif kind == "error":
+            error_msg = payload
+            break
+        elif kind == "progress":
+            last_progress = payload
+            await message.edit(payload)
+
+    if error_msg:
         if _STATUS_AVAILABLE:
             remove_task(task_id)
-        await message.err(str(e))
+        await message.err(error_msg)
+        return
+
+    if _STATUS_AVAILABLE:
+        complete_task(task_id)
+
+    await message.edit(
+        f"✅ **Uploaded Successfully**\n\n"
+        f"**File Name** : `{display_name}`\n"
+        f"**File Size** : `{humanbytes(size)}`\n"
+        f"🔗 **Link** : {result_link}"
+    )
+
+
+def _make_progress_str(file_name: str,
+                       file_size: int,
+                       uploaded: int,
+                       speed: float,
+                       eta: int) -> str:
+    """Build a GDrive-style progress string for GoFile uploads."""
+    percentage = (uploaded / file_size * 100) if file_size else 0
+    filled = math.floor(percentage / 5)
+    bar = (
+        "".join(config.FINISHED_PROGRESS_STR for _ in range(filled))
+        + "".join(config.UNFINISHED_PROGRESS_STR for _ in range(20 - filled))
+    )
+    return (
+        "__Uploading to GoFile...__\n"
+        f"```\n[{bar}]({round(percentage, 2)}%)```\n"
+        f"**File Name** : `{file_name}`\n"
+        f"**File Size** : `{humanbytes(file_size)}`\n"
+        f"**Uploaded** : `{humanbytes(uploaded)}`\n"
+        f"**Completed** : `0/1`\n"
+        f"**Speed** : `{humanbytes(int(speed))}/s`\n"
+        f"**ETA** : `{time_formatter(eta)}`"
+    )
 
 
 class ProgressPayload(BufferedReaderPayload):
@@ -220,8 +290,11 @@ class ProgressPayload(BufferedReaderPayload):
             self._cb(len(chunk))
 
 
-async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
-    """Upload file to GoFile and return share link."""
+async def _upload_to_gofile(src: Path,
+                             task_id: str,
+                             total_size: int,
+                             progress_queue: asyncio.Queue) -> str:
+    """Upload file to GoFile, push progress to queue, and return share link."""
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{_GOFILE_BASE}/servers") as resp:
             data = await resp.json()
@@ -235,14 +308,33 @@ async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
 
         sent = 0
         start = time.time()
+        _last_progress_time = [0.0]  # mutable container so closure can update it
 
         def on_bytes(n: int):
             nonlocal sent
             sent += n
-            elapsed = time.time() - start or 0.001
-            speed = int(sent / elapsed)
+            now = time.time()
+            elapsed = now - start or 0.001
+            speed = sent / elapsed
+            eta = int((total_size - sent) / speed) if speed and total_size > sent else 0
+
+            # Throttle progress pushes to avoid flooding the queue
+            if now - _last_progress_time[0] >= config.Dynamic.EDIT_SLEEP_TIMEOUT:
+                _last_progress_time[0] = now
+                progress_str = _make_progress_str(
+                    file_name=filename,
+                    file_size=total_size,
+                    uploaded=sent,
+                    speed=speed,
+                    eta=eta,
+                )
+                try:
+                    progress_queue.put_nowait(("progress", progress_str))
+                except asyncio.QueueFull:
+                    pass  # drop if consumer is lagging
+
             if _STATUS_AVAILABLE:
-                update_task(task_id, speed=speed, done=sent, total=total_size)
+                update_task(task_id, speed=int(speed), done=sent, total=total_size)
 
         mp = MultipartWriter("form-data")
         with open(src, "rb") as f:
