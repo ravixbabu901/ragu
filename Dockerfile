@@ -41,6 +41,6 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
 COPY . .
 
 RUN mkdir -p /app/logs /bot
-RUN mv -r * /bot/*
+RUN shopt -s dotglob && mv * /bot/ || true
 
 CMD ["bash", "/bot/run"]
