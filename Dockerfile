@@ -38,10 +38,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
-ENV PYTHONPATH="/app:${PYTHONPATH}"
-
 WORKDIR /home
+
+COPY userge ./userge
 
 CMD ["python", "-m", "userge"]
