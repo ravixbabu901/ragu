@@ -201,55 +201,34 @@ async def goup_(message: Message):
 
 
 async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
-    """Upload file to GoFile and return share link."""
-    # Get best server
     async with aiohttp.ClientSession() as session:
+        # GoFile “best server”
         async with session.get(f"{_GOFILE_BASE}/servers") as resp:
             data = await resp.json()
         server = data["data"]["servers"][0]["name"]
         upload_url = f"https://{server}.gofile.io/contents/uploadfile"
 
         headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
-        start = time.time()
-        uploaded_bytes = 0
 
-        async def _file_generator():
-            nonlocal uploaded_bytes
-            with open(src, "rb") as f:
-                while True:
-                    chunk = f.read(1024 * 256)
-                    if not chunk:
-                        break
-                    uploaded_bytes += len(chunk)
-                    elapsed = time.time() - start or 0.001
-                    speed = int(uploaded_bytes / elapsed)
-                    if _STATUS_AVAILABLE:
-                        update_task(task_id,
-                                    speed=speed,
-                                    done=uploaded_bytes,
-                                    total=total_size)
-                    yield chunk
-
+        # IMPORTANT: pass an actual file handle so aiohttp sets multipart filename correctly
         form = aiohttp.FormData()
-        # Use the original filename (no URL encoding applied by aiohttp for the name itself)
-        form.add_field("file", _file_generator(), filename=src.name,
-                       content_type="application/octet-stream")
-        async with session.post(upload_url, data=form, headers=headers) as resp:
-            result = await resp.json()
+        with open(src, "rb") as f:
+            form.add_field(
+                "file",
+                f,
+                filename=src.name,
+                content_type="application/octet-stream",
+            )
+            async with session.post(upload_url, data=form, headers=headers) as resp:
+                result = await resp.json()
 
     if result.get("status") != "ok":
         raise RuntimeError(f"GoFile upload failed: {result}")
 
     file_data = result["data"]
-
-    # Re-upload (skip) to the same folder with the correct name to fix any
-    # filename encoding issues GoFile may have introduced on the first upload.
-    file_id = file_data.get("fileId") or file_data.get("id")
-    if file_id and GOFILE_TOKEN:
-        await _rename_content(file_id, src.name)
-
-    if file_data.get("parentFolder"):
-        return f"https://gofile.io/d/{file_data['parentFolder']}"
+    # if file_data.get("parentFolderCode"): ...
+    if file_data.get("parentFolderCode"):
+        return f"https://gofile.io/d/{file_data['parentFolderCode']}"
     return file_data.get("downloadPage", "")
 
 
