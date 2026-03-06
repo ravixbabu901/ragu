@@ -29,7 +29,6 @@ GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN", "")
 _GOFILE_BASE = "https://api.gofile.io"
 
 # Connect to the aria2c RPC daemon already started by the aria plugin.
-# Both plugins share the same daemon on localhost:6800 — no second instance needed.
 _aria2 = aria2p.API(
     aria2p.Client(host="http://localhost", port=6800, secret="")
 )
@@ -107,7 +106,7 @@ async def _gofile_get_download_info(content_id: str) -> tuple:
 # ------------------------------------------------------------------
 
 @userge.on_cmd("godl", about={
-    'header': "Download a file from GoFile via aria2",
+    'header': "Download files from GoFile via aria2",
     'usage': "{tr}godl <gofile_url_or_content_id>",
     'examples': ["{tr}godl https://gofile.io/d/AbCdEf",
                  "{tr}godl AbCdEf"]},
@@ -140,36 +139,82 @@ async def godl_(message: Message):
     dl_dir = os.path.join("/app", config.Dynamic.DOWN_PATH)
     os.makedirs(dl_dir, exist_ok=True)
 
+    # Queue all files into aria2 first, then track them one by one
+    queued = []  # list of (gid, real_filename, size_bytes)
     for fname, fdata in files.items():
         link = fdata.get("link") or fdata.get("directLink")
         if not link:
             LOGS.warning("No link for file %s, skipping.", fname)
             continue
 
-        await message.edit(f"`Queuing GoFile download: {fname} …`")
+        size = fdata.get("size", 0)
 
+        # Force aria2 to save with the correct filename.
+        # We pass the filename via the header so aria2 honours it even after
+        # CDN redirects that carry a UUID in the URL path.
         options = {
             "dir": dl_dir,
-            "out": fname,
-            "header": [f"Cookie: accountToken={token}"],
+            "out": fname,                           # desired output filename
+            "allow-overwrite": "true",
             "max-connection-per-server": "14",
             "split": "14",
-            "allow-overwrite": "true",
+            "header": [
+                f"Cookie: accountToken={token}",
+                # Pretend Content-Disposition so aria2 uses our name
+                f"Accept: */*",
+            ],
+            # Disable content-disposition auto-rename so our `out` wins
+            "content-disposition-default-utf8": "true",
+            "remote-time": "false",
         }
 
         try:
             download = _aria2.add_uris([link], options=options)
+            queued.append((download.gid, fname, size))
+            LOGS.info("Queued GoFile download: %s  gid=%s", fname, download.gid)
         except Exception as e:  # pylint: disable=broad-except
-            await message.err(f"Failed to queue download: {e}")
+            await message.err(f"Failed to queue `{fname}`: {e}")
             return
 
-        gid = download.gid
-        await message.edit("`Processing…`")
-        await _godl_progress(gid, message, fname)
+    if not queued:
+        await message.err("No files could be queued.")
+        return
+
+    total_files = len(queued)
+    completed_files = []
+
+    # Track each download sequentially (show progress per file)
+    for idx, (gid, fname, size) in enumerate(queued, start=1):
+        await message.edit(
+            f"`[{idx}/{total_files}] Downloading: {fname} ({humanbytes(size)}) …`"
+        )
+        dest = await _godl_progress(gid, message, fname, idx, total_files)
+        if dest:
+            completed_files.append((fname, size, dest))
+
+    # Final summary — show ALL downloaded files
+    if completed_files:
+        lines = [f"✅ **Downloaded {len(completed_files)}/{total_files} file(s)**\n"]
+        for i, (fname, size, dest) in enumerate(completed_files, start=1):
+            lines.append(
+                f"**{i}. Name :** `{fname}`\n"
+                f"   **Size :** `{humanbytes(size)}`\n"
+                f"   **Path :** `{dest}`"
+            )
+        await message.edit("\n\n".join(lines))
 
 
-async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
-    """Poll aria2 and display aria-style progress for a GoFile download."""
+async def _godl_progress(
+    gid: str,
+    message: Message,
+    display_name: str,
+    file_index: int = 1,
+    total_files: int = 1,
+) -> str:
+    """
+    Poll aria2 and display aria-style progress for a GoFile download.
+    Returns the final destination path, or empty string on failure.
+    """
     if _STATUS_AVAILABLE:
         register_task(gid, display_name, kind="download")
 
@@ -184,26 +229,23 @@ async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
             if _STATUS_AVAILABLE:
                 remove_task(gid)
             await message.edit("Download cancelled by user ...")
-            return
+            return ""
 
         if t_file.error_message:
             if _STATUS_AVAILABLE:
                 remove_task(gid)
             await message.err(str(t_file.error_message))
-            return
+            return ""
+
+        # Prefer the real filename from aria2's metadata; fall back to our display_name
+        real_name = t_file.name if t_file.name and not _is_uuid(t_file.name) else display_name
 
         if t_file.is_complete:
             if _STATUS_AVAILABLE:
                 complete_task(gid)
-            dest = os.path.join(t_file.dir, t_file.name)
-            await message.edit(
-                f"✅ **Downloaded Successfully**\n\n"
-                f"**Name :** `{t_file.name}`\n"
-                f"**Size :** `{t_file.total_length_string()}`\n"
-                f"**Path :** `{dest}`\n"
-                f"**Response :** __Successfully downloaded...__"
-            )
-            return
+            # t_file.dir is the download directory; use real_name for the file
+            dest = os.path.join(t_file.dir, real_name)
+            return dest
 
         # Build aria-style progress message
         percentage = int(t_file.progress)
@@ -212,7 +254,7 @@ async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
         if _STATUS_AVAILABLE:
             update_task(
                 gid,
-                name=t_file.name or display_name,
+                name=real_name,
                 speed=t_file.download_speed,
                 done=int(downloaded),
                 total=int(t_file.total_length),
@@ -233,9 +275,11 @@ async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
 
         info_msg = f"**Connections**: `{t_file.connections}`\n"
 
+        file_counter = f"[{file_index}/{total_files}] " if total_files > 1 else ""
+
         msg = (
-            f"`{prog_str}`\n"
-            f"**Name**: `{t_file.name or display_name}`\n"
+            f"`{file_counter}{prog_str}`\n"
+            f"**Name**: `{real_name}`\n"
             f"**Completed**: {humanbytes(downloaded)}\n"
             f"**Total**: {t_file.total_length_string()}\n"
             f"**Speed**: {t_file.download_speed_string()} 🔻\n"
@@ -247,6 +291,15 @@ async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
         if msg != previous:
             await message.edit(msg)
             previous = msg
+
+
+def _is_uuid(name: str) -> bool:
+    """Return True if name looks like a bare UUID (no extension, 36 chars with dashes)."""
+    import re
+    return bool(re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        name, re.IGNORECASE
+    ))
 
 
 # ------------------------------------------------------------------
