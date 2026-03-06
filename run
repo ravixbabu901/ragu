@@ -1,4 +1,3 @@
 #!/bin/bash
 
-cd /bot
-python -m userge
+python -m bot.userge
