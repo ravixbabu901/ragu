@@ -1,4 +1,4 @@
 #!/bin/bash
 
-PYTHONPATH=/bot
+PYTHONPATH="/bot python -m userge"
 python -m userge
