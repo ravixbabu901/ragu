@@ -41,5 +41,6 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
 WORKDIR /app/home
 
 COPY userge ./userge
+RUN mkdir -p /home /app/logs
 
 CMD ["python", "-m", "userge"]
