@@ -5,6 +5,9 @@ import time
 from pathlib import Path
 
 import aiohttp
+import urllib.parse
+from aiohttp import MultipartWriter
+from aiohttp.payload import Payload
 
 from userge import userge, Message, config
 from userge.utils import humanbytes
@@ -200,35 +203,60 @@ async def goup_(message: Message):
         await message.err(str(e))
 
 
-import urllib.parse
-from aiohttp import MultipartWriter, payload
+class ProgressPayload(Payload):
+    """File payload wrapper that updates status while uploading."""
+    def __init__(self, fp, *, callback, content_type, filename):
+        super().__init__(fp, content_type=content_type, filename=filename)
+        self._fp = fp
+        self._cb = callback
+
+    async def write(self, writer):
+        chunk_size = 1024 * 256
+        while True:
+            chunk = self._fp.read(chunk_size)
+            if not chunk:
+                break
+            await writer.write(chunk)
+            self._cb(len(chunk))
+
 
 async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
     """Upload file to GoFile and return share link."""
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{_GOFILE_BASE}/servers") as resp:
             data = await resp.json()
+
         server = data["data"]["servers"][0]["name"]
         upload_url = f"https://{server}.gofile.io/contents/uploadfile"
-
         headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
 
         filename = src.name
-        # RFC 5987 filename* (UTF-8) value
         filename_star = "UTF-8''" + urllib.parse.quote(filename, safe="")
 
+        sent = 0
+        start = time.time()
+
+        def on_bytes(n: int):
+            nonlocal sent
+            sent += n
+            elapsed = time.time() - start or 0.001
+            speed = int(sent / elapsed)
+            if _STATUS_AVAILABLE:
+                update_task(task_id, speed=speed, done=sent, total=total_size)
+
         mp = MultipartWriter("form-data")
-
         with open(src, "rb") as f:
-            part = mp.append(payload.BufferedReaderPayload(f, content_type="application/octet-stream"))
-
-            # Force Content-Disposition similar to curl -F file=@...
-            part.set_content_disposition(
-                "form-data",
-                name="file",
-                filename=filename,
+            part = mp.append(
+                ProgressPayload(
+                    f,
+                    callback=on_bytes,
+                    content_type="application/octet-stream",
+                    filename=filename,
+                )
             )
-            # Also add filename* for servers that prefer it
+
+            # match curl -F file=@...
+            part.set_content_disposition("form-data", name="file", filename=filename)
             part.headers["Content-Disposition"] += f"; filename*={filename_star}"
 
             async with session.post(upload_url, data=mp, headers=headers) as resp:
@@ -238,8 +266,6 @@ async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
         raise RuntimeError(f"GoFile upload failed: {result}")
 
     file_data = result["data"]
-
-
     if file_data.get("parentFolderCode"):
         return f"https://gofile.io/d/{file_data['parentFolderCode']}"
     return file_data.get("downloadPage", "")
