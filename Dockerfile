@@ -39,9 +39,7 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+WORKDIR /home
 
-RUN mkdir -p /app/logs
-RUN mkdir -p /bot && cp -a . /bot/ && rm -rf ./*
-
-
-CMD ["bash", "/bot/run"]
+CMD ["bash", "run"]
