@@ -9,18 +9,12 @@ import urllib.parse
 from pathlib import Path
 
 import aiohttp
+import aria2p
 from aiohttp import MultipartWriter
 from aiohttp.payload import BufferedReaderPayload
 
 from userge import userge, Message, config
 from userge.utils import humanbytes, time_formatter
-
-# Reuse the shared aria2p client from the aria plugin
-try:
-    from userge.plugins.custom.aria import aria2p_client
-    _ARIA_AVAILABLE = True
-except Exception:  # pylint: disable=broad-except
-    _ARIA_AVAILABLE = False
 
 try:
     from userge.plugins.custom.status import (
@@ -33,6 +27,12 @@ LOGS = userge.getLogger(__name__)
 
 GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN", "")
 _GOFILE_BASE = "https://api.gofile.io"
+
+# Connect to the aria2c RPC daemon already started by the aria plugin.
+# Both plugins share the same daemon on localhost:6800 — no second instance needed.
+_aria2 = aria2p.API(
+    aria2p.Client(host="http://localhost", port=6800, secret="")
+)
 
 # ------------------------------------------------------------------
 # GoFile 2026 auth helpers
@@ -76,7 +76,7 @@ async def _gofile_get_download_info(content_id: str) -> tuple:
 
         token = acc_data["data"]["token"]
 
-        # 2. Add auth headers (2026 requirement)
+        # 2. Add 2026 required auth headers
         headers["Authorization"] = f"Bearer {token}"
         headers["Cookie"] = f"accountToken={token}"
         headers["X-Website-Token"] = _generate_x_website_token(token)
@@ -114,11 +114,6 @@ async def _gofile_get_download_info(content_id: str) -> tuple:
     check_downpath=True)
 async def godl_(message: Message):
     """ download from GoFile """
-    if not _ARIA_AVAILABLE:
-        await message.err(
-            "aria2p client not available. Make sure the aria plugin is loaded.")
-        return
-
     inp = message.input_str.strip() if message.input_str else ""
     if not inp:
         await message.err("Provide a GoFile URL or content ID.")
@@ -153,7 +148,6 @@ async def godl_(message: Message):
 
         await message.edit(f"`Queuing GoFile download: {fname} …`")
 
-        # Add to aria2 with the required auth cookie
         options = {
             "dir": dl_dir,
             "out": fname,
@@ -164,7 +158,7 @@ async def godl_(message: Message):
         }
 
         try:
-            download = aria2p_client.add_uris([link], options=options)
+            download = _aria2.add_uris([link], options=options)
         except Exception as e:  # pylint: disable=broad-except
             await message.err(f"Failed to queue download: {e}")
             return
@@ -185,7 +179,7 @@ async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
         await asyncio.sleep(config.Dynamic.EDIT_SLEEP_TIMEOUT)
 
         try:
-            t_file = aria2p_client.get_download(gid)
+            t_file = _aria2.get_download(gid)
         except Exception:  # pylint: disable=broad-except
             if _STATUS_AVAILABLE:
                 remove_task(gid)
@@ -237,7 +231,6 @@ async def _godl_progress(gid: str, message: Message, display_name: str) -> None:
             t_file.progress_string(),
         )
 
-        # GoFile downloads are HTTP, not torrents — seeder is always None
         info_msg = f"**Connections**: `{t_file.connections}`\n"
 
         msg = (
