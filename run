@@ -1,3 +1,4 @@
 #!/bin/bash
 
-nohup python -m userge > output.log 2>&1 & cd /home
+nohup python3 -m userge &
+cd /home
