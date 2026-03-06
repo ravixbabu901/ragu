@@ -200,9 +200,12 @@ async def goup_(message: Message):
         await message.err(str(e))
 
 
+import urllib.parse
+from aiohttp import MultipartWriter, payload
+
 async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
+    """Upload file to GoFile and return share link."""
     async with aiohttp.ClientSession() as session:
-        # GoFile “best server”
         async with session.get(f"{_GOFILE_BASE}/servers") as resp:
             data = await resp.json()
         server = data["data"]["servers"][0]["name"]
@@ -210,23 +213,37 @@ async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
 
         headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
 
-        # IMPORTANT: pass an actual file handle so aiohttp sets multipart filename correctly
-        form = aiohttp.FormData()
+        filename = src.name
+        # RFC 5987 filename* (UTF-8) value
+        filename_star = "UTF-8''" + urllib.parse.quote(filename, safe="")
+
+        mp = MultipartWriter("form-data")
+
         with open(src, "rb") as f:
-            form.add_field(
-                "file",
-                f,
-                filename=src.name,
-                content_type="application/octet-stream",
+            part = mp.append(payload.BufferedReaderPayload(f, content_type="application/octet-stream"))
+
+            # Force Content-Disposition similar to curl -F file=@...
+            part.set_content_disposition(
+                "form-data",
+                name="file",
+                filename=filename,
             )
-            async with session.post(upload_url, data=form, headers=headers) as resp:
+            # Also add filename* for servers that prefer it
+            part.headers["Content-Disposition"] += f"; filename*={filename_star}"
+
+            async with session.post(upload_url, data=mp, headers=headers) as resp:
                 result = await resp.json()
 
     if result.get("status") != "ok":
         raise RuntimeError(f"GoFile upload failed: {result}")
 
     file_data = result["data"]
-    # if file_data.get("parentFolderCode"): ...
+
+    # Optional best-effort rename using returned content id (often UUID-like in `id`)
+    content_id = file_data.get("id")
+    if content_id:
+        await _rename_content(content_id, filename)
+
     if file_data.get("parentFolderCode"):
         return f"https://gofile.io/d/{file_data['parentFolderCode']}"
     return file_data.get("downloadPage", "")
