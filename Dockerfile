@@ -42,4 +42,4 @@ COPY . .
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 WORKDIR /home
 
-CMD ["bash", "run"]
+CMD ["bash", "/app/run"]
