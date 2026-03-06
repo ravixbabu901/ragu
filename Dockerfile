@@ -40,4 +40,8 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
 
 COPY . .
 
-CMD ["bash", "run"]
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
+WORKDIR /home
+
+CMD ["python", "-m", "userge"]
