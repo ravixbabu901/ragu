@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import math
 import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -139,8 +140,10 @@ async def godl_(message: Message):
     dl_dir = os.path.join("/app", config.Dynamic.DOWN_PATH)
     os.makedirs(dl_dir, exist_ok=True)
 
-    # Queue all files into aria2 first, then track them one by one
-    queued = []  # list of (gid, real_filename, size_bytes)
+    # Queue all files into aria2 — NO `out` option, let aria2 use
+    # the server's Content-Disposition header for the real filename,
+    # exactly like your working gofile_2026.py does with plain aria2c.
+    queued = []  # list of (gid, api_filename, size_bytes)
     for fname, fdata in files.items():
         link = fdata.get("link") or fdata.get("directLink")
         if not link:
@@ -149,23 +152,14 @@ async def godl_(message: Message):
 
         size = fdata.get("size", 0)
 
-        # Force aria2 to save with the correct filename.
-        # We pass the filename via the header so aria2 honours it even after
-        # CDN redirects that carry a UUID in the URL path.
         options = {
             "dir": dl_dir,
-            "out": fname,                           # desired output filename
+            # NO "out" — let aria2 pick up the real name from
+            # Content-Disposition, same as bare aria2c -s14 -x14
             "allow-overwrite": "true",
             "max-connection-per-server": "14",
             "split": "14",
-            "header": [
-                f"Cookie: accountToken={token}",
-                # Pretend Content-Disposition so aria2 uses our name
-                f"Accept: */*",
-            ],
-            # Disable content-disposition auto-rename so our `out` wins
-            "content-disposition-default-utf8": "true",
-            "remote-time": "false",
+            "header": [f"Cookie: accountToken={token}"],
         }
 
         try:
@@ -183,16 +177,16 @@ async def godl_(message: Message):
     total_files = len(queued)
     completed_files = []
 
-    # Track each download sequentially (show progress per file)
-    for idx, (gid, fname, size) in enumerate(queued, start=1):
+    # Track each download sequentially — show live aria-style progress
+    for idx, (gid, api_fname, size) in enumerate(queued, start=1):
         await message.edit(
-            f"`[{idx}/{total_files}] Downloading: {fname} ({humanbytes(size)}) …`"
+            f"`[{idx}/{total_files}] Starting: {api_fname} ({humanbytes(size)}) …`"
         )
-        dest = await _godl_progress(gid, message, fname, idx, total_files)
-        if dest:
-            completed_files.append((fname, size, dest))
+        result = await _godl_progress(gid, message, api_fname, idx, total_files)
+        if result:
+            completed_files.append(result)
 
-    # Final summary — show ALL downloaded files
+    # Final summary — ALL downloaded files
     if completed_files:
         lines = [f"✅ **Downloaded {len(completed_files)}/{total_files} file(s)**\n"]
         for i, (fname, size, dest) in enumerate(completed_files, start=1):
@@ -207,54 +201,56 @@ async def godl_(message: Message):
 async def _godl_progress(
     gid: str,
     message: Message,
-    display_name: str,
+    api_name: str,
     file_index: int = 1,
     total_files: int = 1,
-) -> str:
+):
     """
     Poll aria2 and display aria-style progress for a GoFile download.
-    Returns the final destination path, or empty string on failure.
+    Returns (real_name, size, dest_path) tuple on success, None on failure.
+
+    We use the name aria2 resolves (from Content-Disposition) as soon as it
+    appears; until then we show the API filename as a placeholder.
     """
     if _STATUS_AVAILABLE:
-        register_task(gid, display_name, kind="download")
+        register_task(gid, api_name, kind="download")
 
     previous = ""
 
     while True:
-        await asyncio.sleep(config.Dynamic.EDIT_SLEEP_TIMEOUT)
-
         try:
             t_file = _aria2.get_download(gid)
         except Exception:  # pylint: disable=broad-except
             if _STATUS_AVAILABLE:
                 remove_task(gid)
             await message.edit("Download cancelled by user ...")
-            return ""
+            return None
 
         if t_file.error_message:
             if _STATUS_AVAILABLE:
                 remove_task(gid)
             await message.err(str(t_file.error_message))
-            return ""
+            return None
 
-        # Prefer the real filename from aria2's metadata; fall back to our display_name
-        real_name = t_file.name if t_file.name and not _is_uuid(t_file.name) else display_name
+        # Use whatever name aria2 has resolved so far; fall back to the API name
+        # while aria2 is still connecting / resolving the redirect.
+        resolved_name = t_file.name if t_file.name else api_name
 
         if t_file.is_complete:
             if _STATUS_AVAILABLE:
                 complete_task(gid)
-            # t_file.dir is the download directory; use real_name for the file
-            dest = os.path.join(t_file.dir, real_name)
-            return dest
+            dest = os.path.join(t_file.dir, t_file.name or api_name)
+            final_size = t_file.total_length or 0
+            return (resolved_name, final_size, dest)
 
-        # Build aria-style progress message
+        # ---- build progress message ----
         percentage = int(t_file.progress)
-        downloaded = percentage * int(t_file.total_length) / 100
+        downloaded = percentage * int(t_file.total_length) / 100 if t_file.total_length else 0
 
         if _STATUS_AVAILABLE:
             update_task(
                 gid,
-                name=real_name,
+                name=resolved_name,
                 speed=t_file.download_speed,
                 done=int(downloaded),
                 total=int(t_file.total_length),
@@ -274,12 +270,11 @@ async def _godl_progress(
         )
 
         info_msg = f"**Connections**: `{t_file.connections}`\n"
-
         file_counter = f"[{file_index}/{total_files}] " if total_files > 1 else ""
 
         msg = (
             f"`{file_counter}{prog_str}`\n"
-            f"**Name**: `{real_name}`\n"
+            f"**Name**: `{resolved_name}`\n"
             f"**Completed**: {humanbytes(downloaded)}\n"
             f"**Total**: {t_file.total_length_string()}\n"
             f"**Speed**: {t_file.download_speed_string()} 🔻\n"
@@ -292,14 +287,8 @@ async def _godl_progress(
             await message.edit(msg)
             previous = msg
 
-
-def _is_uuid(name: str) -> bool:
-    """Return True if name looks like a bare UUID (no extension, 36 chars with dashes)."""
-    import re
-    return bool(re.fullmatch(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        name, re.IGNORECASE
-    ))
+        # Sleep AFTER displaying, not before — so we never miss the first update
+        await asyncio.sleep(config.Dynamic.EDIT_SLEEP_TIMEOUT)
 
 
 # ------------------------------------------------------------------
