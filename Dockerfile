@@ -44,4 +44,4 @@ RUN mkdir -p /app/logs
 
 WORKDIR /home
 
-CMD ["bash", "run"]
+CMD ["bash", "/app/run"]
