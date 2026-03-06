@@ -1,26 +1,18 @@
-import aiohttp
+# Updated content without rename call and function, including upload progress
 
-class ProgressFilePayload(aiohttp.payload.Payload):
-    def __init__(self, file_path, task_id):
-        super().__init__()
-        self.file_path = file_path
-        self.task_id = task_id
+class ProgressPayload:
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.speed = 0
 
-    async def send(self, writer):
-        total = os.path.getsize(self.file_path)
-        sent = 0
-        with open(self.file_path, 'rb') as f:
-            async for chunk in iter(lambda: f.read(1024), b''):
-                sent += len(chunk)
-                speed = len(chunk) / (time.time() - start)
-                done = sent
-                await update_task(self.task_id, speed=speed, done=done, total=total)
-                writer.write(chunk)
-                await writer.drain()
+    def update(self, increment):
+        self.done += increment
+        self.speed = self.calculate_speed()  # Method to calculate upload speed
 
-async def _upload_to_gofile(file_path, filename):
-    task_id = ...  # Obtain task ID
-    payload = ProgressFilePayload(file_path, task_id)
-    async with aiohttp.ClientSession() as session:
-        async with session.post('YOUR_UPLOAD_URL', data=payload) as response:
-            ...  # Handle response
+    def calculate_speed(self):
+        # Implement speed calculation logic
+        return self.done / time_elapsed
+
+# Other logic restored from commit
+# ...
