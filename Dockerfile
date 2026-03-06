@@ -38,7 +38,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-WORKDIR /app/home
+WORKDIR /home
 
 COPY userge ./userge
 RUN mkdir -p /home /app/logs
