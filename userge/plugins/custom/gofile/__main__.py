@@ -28,7 +28,8 @@ LOGS = userge.getLogger(__name__)
 GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN", "")
 _GOFILE_BASE = "https://api.gofile.io"
 
-# ── Lazy aria2p — only instantiated when .godl is first used ──────────────────
+# Lazy aria2p client — only connected when first needed by .godl
+# so that gofile loads even if the aria plugin hasn't started aria2c yet.
 _aria2 = None  # type: ignore
 
 _UUID_RE = re.compile(
@@ -45,15 +46,16 @@ def _get_aria2():
             _aria2 = aria2p.API(
                 aria2p.Client(host="http://localhost", port=6800, secret="")
             )
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as e:  # pylint: disable=broad-except
             raise RuntimeError(
-                f"aria2p client not available. "
-                f"Make sure the aria plugin is loaded. ({exc})"
-            ) from exc
+                f"aria2p client not available. Make sure the aria plugin is loaded. ({e})"
+            ) from e
     return _aria2
 
 
-# ── GoFile 2026 auth ──────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# GoFile 2026 auth helpers
+# ------------------------------------------------------------------
 
 _GOFILE_UA = "Mozilla/5.0"
 _GOFILE_LANG = "en-US"
@@ -70,7 +72,9 @@ def _generate_x_website_token(bearer_token: str) -> str:
 
 
 async def _gofile_get_download_info(content_id: str) -> tuple:
-    """Return (account_token, files_dict) using the 2026 auth flow."""
+    """
+    Returns (account_token, files_dict) using the 2026 auth flow.
+    """
     async with aiohttp.ClientSession() as session:
         headers = {"User-Agent": _GOFILE_UA, "Origin": "https://gofile.io"}
 
@@ -145,15 +149,15 @@ async def _resolve_folder_id(session: aiohttp.ClientSession, code_or_uuid: str) 
     return folder_id
 
 
-# ── Download (.godl) ──────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Download command  (.godl)
+# ------------------------------------------------------------------
 
 @userge.on_cmd("godl", about={
     'header': "Download files from GoFile via aria2",
     'usage': "{tr}godl <gofile_url_or_content_id>",
-    'examples': [
-        "{tr}godl https://gofile.io/d/AbCdEf",
-        "{tr}godl AbCdEf",
-    ]},
+    'examples': ["{tr}godl https://gofile.io/d/AbCdEf",
+                 "{tr}godl AbCdEf"]},
     check_downpath=True)
 async def godl_(message: Message):
     """ download from GoFile """
@@ -171,8 +175,8 @@ async def godl_(message: Message):
 
     try:
         token, files = await _gofile_get_download_info(content_id)
-    except Exception as exc:  # pylint: disable=broad-except
-        await message.err(str(exc))
+    except Exception as e:  # pylint: disable=broad-except
+        await message.err(str(e))
         return
 
     if not files:
@@ -181,8 +185,8 @@ async def godl_(message: Message):
 
     try:
         aria2 = _get_aria2()
-    except RuntimeError as exc:
-        await message.err(str(exc))
+    except RuntimeError as e:
+        await message.err(str(e))
         return
 
     dl_dir = os.path.join("/app", config.Dynamic.DOWN_PATH)
@@ -208,8 +212,8 @@ async def godl_(message: Message):
             download = aria2.add_uris([link], options=options)
             queued.append((download.gid, fname, size))
             LOGS.info("Queued GoFile download: %s  gid=%s", fname, download.gid)
-        except Exception as exc:  # pylint: disable=broad-except
-            await message.err(f"Failed to queue `{fname}`: {exc}")
+        except Exception as e:  # pylint: disable=broad-except
+            await message.err(f"Failed to queue `{fname}`: {e}")
             return
 
     if not queued:
@@ -329,7 +333,9 @@ async def _godl_progress(
         await asyncio.sleep(config.Dynamic.EDIT_SLEEP_TIMEOUT)
 
 
-# ── Upload helpers ────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Upload helpers
+# ------------------------------------------------------------------
 
 async def _get_best_server(session: aiohttp.ClientSession) -> str:
     async with session.get(f"{_GOFILE_BASE}/servers") as resp:
@@ -384,6 +390,18 @@ def _make_progress_str(
     )
 
 
+# ------------------------------------------------------------------ #
+#  _upload_single_file — THE CANONICAL IMPLEMENTATION                 #
+#                                                                      #
+#  SOURCE OF TRUTH: commit 2228596946146266f3d1bcc42c3954823a68dd94   #
+#                                                                      #
+#  NEVER change this function's upload mechanism.                      #
+#  It uses aiohttp.FormData with the raw (unencoded) filename.         #
+#  DO NOT add urllib.parse.quote / filename_star / MultipartWriter.    #
+#  aiohttp handles RFC 5987 Content-Disposition encoding internally.  #
+#  Any manual pre-encoding causes double-encoding on GoFile's side     #
+#  → filenames become "Ingrid%20Goes%20West%20%282017%29...".          #
+# ------------------------------------------------------------------ #
 async def _upload_single_file(
     session: aiohttp.ClientSession,
     server: str,
@@ -396,76 +414,69 @@ async def _upload_single_file(
     total_count: int = 1,
 ) -> dict:
     """
-    Upload one file to GoFile. Returns result["data"] dict.
-
-    IMPORTANT: filename is passed RAW (unencoded) to aiohttp.FormData.
-    aiohttp handles RFC 5987 Content-Disposition encoding internally.
-    DO NOT call urllib.parse.quote() on the filename — it causes double-encoding
-    which produces names like 'Ingrid%20Goes%20West%20%282017%29...' on GoFile.
+    Upload one file to GoFile using aiohttp.FormData (supports folderId).
+    Returns result["data"] dict.
     """
     upload_url = f"https://{server}.gofile.io/contents/uploadfile"
-    auth_headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
+    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
 
-    filename = src.name   # raw, unencoded — e.g. "My Movie (2026).mkv"
-
+    filename = src.name          # raw, unencoded — NEVER call quote() on this
     sent = 0
     start = time.time()
-    _last_push = [0.0]
+    _last_progress_time = [0.0]
 
-    def on_chunk(n: int) -> None:
+    def on_bytes(n: int):
         nonlocal sent
         sent += n
         now = time.time()
-        elapsed = (now - start) or 0.001
+        elapsed = now - start or 0.001
         speed = sent / elapsed
         eta = int((total_size - sent) / speed) if speed and total_size > sent else 0
-        if now - _last_push[0] >= config.Dynamic.EDIT_SLEEP_TIMEOUT:
-            _last_push[0] = now
+
+        if now - _last_progress_time[0] >= config.Dynamic.EDIT_SLEEP_TIMEOUT:
+            _last_progress_time[0] = now
+            progress_str = _make_progress_str(
+                file_name=filename,
+                file_size=total_size,
+                uploaded=sent,
+                speed=speed,
+                eta=eta,
+                completed=completed_count,
+                total_count=total_count,
+            )
             try:
-                progress_queue.put_nowait((
-                    "progress",
-                    _make_progress_str(
-                        file_name=filename,
-                        file_size=total_size,
-                        uploaded=sent,
-                        speed=speed,
-                        eta=eta,
-                        completed=completed_count,
-                        total_count=total_count,
-                    )
-                ))
+                progress_queue.put_nowait(("progress", progress_str))
             except asyncio.QueueFull:
                 pass
+
         if _STATUS_AVAILABLE:
             update_task(task_id, speed=int(speed), done=sent, total=total_size)
 
-    chunk_size = 256 * 1024  # 256 KB
-
-    async def file_sender():
+    async def _file_gen():
         with open(src, "rb") as f:
             while True:
-                chunk = f.read(chunk_size)
+                chunk = f.read(256 * 1024)
                 if not chunk:
                     break
-                on_chunk(len(chunk))
+                on_bytes(len(chunk))
                 yield chunk
 
-    # Pass filename directly — no url-quoting.
     form = aiohttp.FormData()
+    # folderId MUST come before file in the form
     if folder_id:
         form.add_field("folderId", folder_id)
     form.add_field(
         "file",
-        file_sender(),
-        filename=filename,
+        _file_gen(),
+        filename=filename,                        # raw filename — aiohttp encodes correctly
         content_type="application/octet-stream",
     )
 
-    async with session.post(upload_url, data=form, headers=auth_headers) as resp:
+    async with session.post(upload_url, data=form, headers=headers) as resp:
         result = await resp.json()
 
     if result.get("status") != "ok":
-        raise RuntimeError(f"GoFile upload failed for '{filename}': {result}")
+        raise RuntimeError(f"GoFile upload failed: {result}")
 
     return result["data"]
 
@@ -475,15 +486,15 @@ async def _progress_display_loop(
     progress_queue: asyncio.Queue,
 ) -> tuple:
     """
-    Drain the progress queue, updating the Telegram message.
-    Returns (result_link_or_None, error_msg_or_None) when a sentinel arrives.
+    Drain the progress queue until a ("done",...) or ("error",...) sentinel arrives.
+    Returns (result_link_or_None, error_msg_or_None).
     """
     last_progress = None
     while True:
         try:
             item = await asyncio.wait_for(
                 progress_queue.get(),
-                timeout=config.Dynamic.EDIT_SLEEP_TIMEOUT,
+                timeout=config.Dynamic.EDIT_SLEEP_TIMEOUT
             )
         except asyncio.TimeoutError:
             if last_progress:
@@ -505,6 +516,43 @@ async def _progress_display_loop(
                 await message.edit(payload)
             except Exception:  # pylint: disable=broad-except
                 pass
+
+
+def _resolve_glob_patterns(patterns: List[str], base_dir: Path) -> List[Path]:
+    """Resolve glob patterns, returning a sorted deduplicated list of file Paths."""
+    found: List[Path] = []
+    seen: set = set()
+
+    for pat in patterns:
+        pat = pat.strip()
+        if not pat:
+            continue
+        p = Path(pat)
+        # Try as absolute/relative glob first
+        matches = sorted(_glob.glob(pat))
+        if not matches:
+            # Try relative to DOWN_PATH
+            matches = sorted(_glob.glob(str(base_dir / pat)))
+        if matches:
+            for m in matches:
+                mp = Path(m).resolve()
+                if mp not in seen:
+                    seen.add(mp)
+                    found.append(Path(m))
+        else:
+            # Literal path
+            if p.is_absolute():
+                candidates = [p]
+            else:
+                candidates = [p, base_dir / pat]
+            for candidate in candidates:
+                rp = candidate.resolve()
+                if rp not in seen and (candidate.is_file() or candidate.is_dir()):
+                    seen.add(rp)
+                    found.append(candidate)
+                    break
+
+    return found
 
 
 async def _create_gofile_folder(
@@ -562,7 +610,9 @@ async def _create_gofile_folder(
     return folder_uuid, share_code
 
 
-# ── Upload (.goup) ────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Upload command  (.goup)
+# ------------------------------------------------------------------
 
 @userge.on_cmd("goup", about={
     'header': "Upload file(s) or a folder to GoFile",
@@ -590,7 +640,7 @@ async def goup_(message: Message):
         await message.err("Provide a file path, folder path, or pipe-separated patterns.")
         return
 
-    # ── Parse optional existing-folder second line ─────────────────────────
+    # ── Optional existing-folder on 2nd line ──────────────────────────────
     existing_folder_ref: Optional[str] = None
     if "\n" in raw:
         raw, second_line = raw.split("\n", 1)
@@ -602,43 +652,20 @@ async def goup_(message: Message):
             else:
                 existing_folder_ref = second_line
 
-    # ── Resolve file/folder list ───────────────────────────────────────────
+    base_dir = Path(config.Dynamic.DOWN_PATH)
     segments = [s.strip() for s in raw.split("|") if s.strip()]
-    srcs: List[Path] = []
-
-    for seg in segments:
-        matches = _glob.glob(seg)
-        if not matches:
-            matches = _glob.glob(os.path.join(config.Dynamic.DOWN_PATH, seg))
-        if matches:
-            for m in sorted(matches):
-                p = Path(m)
-                if p.is_file():
-                    srcs.append(p)
-                elif p.is_dir():
-                    srcs.append(p)
-        else:
-            p = Path(seg)
-            if not p.is_file():
-                p = Path(config.Dynamic.DOWN_PATH) / seg
-            if p.is_file():
-                srcs.append(p)
-            elif p.is_dir():
-                srcs.append(p)
-            else:
-                await message.err(f"Not found: `{seg}`")
-                return
+    srcs = _resolve_glob_patterns(segments, base_dir)
 
     if not srcs:
         await message.err("No files matched the given pattern(s).")
         return
 
-    # ── Single directory ───────────────────────────────────────────────────
+    # Single directory → folder upload
     if len(srcs) == 1 and srcs[0].is_dir():
         await _goup_folder(message, srcs[0], existing_folder_ref)
         return
 
-    # ── One or more files ──────────────────────────────────────────────────
+    # One or more files
     file_srcs = [p for p in srcs if p.is_file()]
     if not file_srcs:
         await message.err("No uploadable files found.")
@@ -650,7 +677,9 @@ async def goup_(message: Message):
         await _goup_multi(message, file_srcs, existing_folder_ref)
 
 
-# ── Single-file upload ────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Single-file upload
+# ------------------------------------------------------------------
 
 async def _goup_file(
     message: Message,
@@ -735,7 +764,9 @@ async def _goup_file(
     )
 
 
-# ── Multi-file upload (pipe-separated) ───────────────────────────────────────
+# ------------------------------------------------------------------
+# Multi-file upload (pipe-separated patterns)
+# ------------------------------------------------------------------
 
 async def _goup_multi(
     message: Message,
@@ -744,7 +775,7 @@ async def _goup_multi(
 ) -> None:
     total_count = len(srcs)
     total_size  = sum(s.stat().st_size for s in srcs)
-    folder_display_name = srcs[0].name  # folder named after first file
+    folder_display_name = srcs[0].name  # GoFile folder named after first file
 
     await message.edit(
         f"`Uploading {total_count} file(s) to GoFile "
@@ -761,7 +792,7 @@ async def _goup_multi(
 
                 if existing_folder_ref:
                     folder_id  = await _resolve_folder_id(session, existing_folder_ref)
-                    share_code = existing_folder_ref  # used in link
+                    share_code = existing_folder_ref
                 else:
                     folder_id, share_code = await _create_gofile_folder(
                         session, folder_display_name
@@ -783,7 +814,6 @@ async def _goup_multi(
                     if _STATUS_AVAILABLE:
                         complete_task(task_id)
 
-                    # Pick up share code from first response if not already known
                     if not share_code:
                         share_code = (
                             file_data.get("parentFolderCode")
@@ -797,10 +827,7 @@ async def _goup_multi(
                                 if "/d/" in dl_page else ""
                             )
 
-                link = (
-                    f"https://gofile.io/d/{share_code}"
-                    if share_code else "N/A"
-                )
+                link = f"https://gofile.io/d/{share_code}" if share_code else "N/A"
                 await progress_queue.put(("done", link))
         except Exception as exc:  # pylint: disable=broad-except
             await progress_queue.put(("error", str(exc)))
@@ -822,7 +849,9 @@ async def _goup_multi(
     )
 
 
-# ── Folder upload ─────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Folder upload
+# ------------------------------------------------------------------
 
 async def _goup_folder(
     message: Message,
@@ -834,9 +863,9 @@ async def _goup_folder(
         await message.err(f"No files found in `{src_dir}`.")
         return
 
-    total_count  = len(all_files)
-    total_size   = sum(f.stat().st_size for f in all_files)
-    folder_name  = src_dir.name
+    total_count = len(all_files)
+    total_size  = sum(f.stat().st_size for f in all_files)
+    folder_name = src_dir.name
 
     await message.edit(
         f"`Uploading folder '{folder_name}' — "
@@ -888,10 +917,7 @@ async def _goup_folder(
                                 if "/d/" in dl_page else ""
                             )
 
-                link = (
-                    f"https://gofile.io/d/{share_code}"
-                    if share_code else "N/A"
-                )
+                link = f"https://gofile.io/d/{share_code}" if share_code else "N/A"
                 await progress_queue.put(("done", link))
         except Exception as exc:  # pylint: disable=broad-except
             await progress_queue.put(("error", str(exc)))
