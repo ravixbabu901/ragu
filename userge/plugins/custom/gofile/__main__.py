@@ -28,7 +28,7 @@ LOGS = userge.getLogger(__name__)
 GOFILE_TOKEN = os.environ.get("GOFILE_TOKEN", "")
 _GOFILE_BASE = "https://api.gofile.io"
 
-# Lazy aria2p client — connected only when .godl is first called.
+# Lazy aria2p client — only connected when first needed by .godl
 _aria2 = None  # type: ignore
 
 
@@ -42,7 +42,7 @@ def _get_aria2():
             )
         except Exception as e:  # pylint: disable=broad-except
             raise RuntimeError(
-                f"aria2p client not available. Is the aria plugin loaded? ({e})"
+                f"aria2p client not available. Make sure the aria plugin is loaded. ({e})"
             ) from e
     return _aria2
 
@@ -72,7 +72,9 @@ def _generate_x_website_token(bearer_token: str) -> str:
 
 
 async def _gofile_get_download_info(content_id: str) -> tuple:
-    """Returns (account_token, files_dict) using the 2026 auth flow."""
+    """
+    Returns (account_token, files_dict) using the 2026 auth flow.
+    """
     async with aiohttp.ClientSession() as session:
         headers = {"User-Agent": _GOFILE_UA, "Origin": "https://gofile.io"}
 
@@ -368,27 +370,6 @@ async def _rename_gofile_content(
         LOGS.warning("GoFile rename failed for %s → %s: %s", content_id, new_name, data)
 
 
-async def _create_gofile_folder(
-    session: aiohttp.ClientSession,
-    parent_folder_id: str,
-    folder_name: str,
-) -> str:
-    headers = {
-        "Authorization": f"Bearer {GOFILE_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {"parentFolderId": parent_folder_id, "folderName": folder_name}
-    async with session.post(
-        f"{_GOFILE_BASE}/contents/createFolder",
-        headers=headers,
-        json=payload,
-    ) as resp:
-        data = await resp.json()
-    if data.get("status") != "ok":
-        raise RuntimeError(f"GoFile create folder failed: {data}")
-    return data["data"]["folderId"]
-
-
 def _make_progress_str(
     file_name: str,
     file_size: int,
@@ -428,28 +409,32 @@ async def _upload_single_file(
     total_count: int = 1,
 ) -> dict:
     """
-    Upload one file to GoFile using aiohttp.FormData.
-    folder_id MUST be the internal UUID, not a share code.
-    Returns result["data"] dict.
+    Upload one file to GoFile. Returns the parsed JSON response data dict.
+
+    Key fix: filename is passed RAW (unencoded) directly into aiohttp FormData.
+    aiohttp handles RFC 5987 encoding internally when needed. Using
+    urllib.parse.quote() on the filename before passing it to aiohttp causes
+    double-encoding, producing names like
+    'Ingrid%20Goes%20West%20%282017%29...' on the GoFile side.
     """
     upload_url = f"https://{server}.gofile.io/contents/uploadfile"
-    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
+    auth_headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
 
-    filename = src.name
+    filename = src.name  # RAW, unencoded — e.g. "Ingrid Goes West (2017)...mkv"
+
     sent = 0
     start = time.time()
-    _last_progress_time = [0.0]
+    _last_push = [0.0]
 
-    def on_bytes(n: int):
+    def on_chunk(chunk_len: int) -> None:
         nonlocal sent
-        sent += n
+        sent += chunk_len
         now = time.time()
-        elapsed = now - start or 0.001
+        elapsed = (now - start) or 0.001
         speed = sent / elapsed
         eta = int((total_size - sent) / speed) if speed and total_size > sent else 0
-
-        if now - _last_progress_time[0] >= config.Dynamic.EDIT_SLEEP_TIMEOUT:
-            _last_progress_time[0] = now
+        if now - _last_push[0] >= config.Dynamic.EDIT_SLEEP_TIMEOUT:
+            _last_push[0] = now
             progress_str = _make_progress_str(
                 file_name=filename,
                 file_size=total_size,
@@ -463,44 +448,39 @@ async def _upload_single_file(
                 progress_queue.put_nowait(("progress", progress_str))
             except asyncio.QueueFull:
                 pass
-
         if _STATUS_AVAILABLE:
             update_task(task_id, speed=int(speed), done=sent, total=total_size)
 
-    async def _file_gen():
+    # Read the file in chunks and feed to aiohttp via an async generator,
+    # calling the progress callback as we go.
+    chunk_size = 256 * 1024  # 256 KB
+
+    async def file_sender():
         with open(src, "rb") as f:
             while True:
-                chunk = f.read(256 * 1024)
+                chunk = f.read(chunk_size)
                 if not chunk:
                     break
-                on_bytes(len(chunk))
+                on_chunk(len(chunk))
                 yield chunk
 
+    # Use aiohttp FormData — pass filename as-is (no manual URL encoding).
+    # aiohttp will encode it correctly in the Content-Disposition header.
     form = aiohttp.FormData()
-    # folderId MUST come before the file field
-    if folder_id:
-        form.add_field("folderId", folder_id)
     form.add_field(
         "file",
-        _file_gen(),
-        filename=filename,
+        file_sender(),
+        filename=filename,              # raw filename, NOT url-encoded
         content_type="application/octet-stream",
     )
+    if folder_id:
+        form.add_field("folderId", folder_id)
 
-    async with session.post(upload_url, data=form, headers=headers) as resp:
-        # GoFile may return HTML on error — catch JSON decode failures gracefully
-        content_type = resp.headers.get("Content-Type", "")
-        raw_text = await resp.text()
-        if "application/json" not in content_type and "json" not in content_type:
-            raise RuntimeError(
-                f"GoFile upload returned non-JSON response "
-                f"(HTTP {resp.status}): {raw_text[:200]}"
-            )
-        import json  # pylint: disable=import-outside-toplevel
-        result = json.loads(raw_text)
+    async with session.post(upload_url, data=form, headers=auth_headers) as resp:
+        result = await resp.json()
 
     if result.get("status") != "ok":
-        raise RuntimeError(f"GoFile upload failed: {result}")
+        raise RuntimeError(f"GoFile upload failed for '{filename}': {result}")
 
     return result["data"]
 
@@ -510,87 +490,60 @@ async def _progress_display_loop(
     progress_queue: asyncio.Queue,
 ) -> tuple:
     """
-    Drain progress_queue until ("done",...) or ("error",...).
-    Returns (link_or_None, error_or_None).
+    Drain the progress queue, updating the message until a 'done' or 'error'
+    sentinel arrives. Returns (result_link, error_msg).
     """
     last_progress = None
+    result_link = None
+    error_msg = None
+
     while True:
         try:
             item = await asyncio.wait_for(
                 progress_queue.get(),
-                timeout=config.Dynamic.EDIT_SLEEP_TIMEOUT
+                timeout=config.Dynamic.EDIT_SLEEP_TIMEOUT,
             )
         except asyncio.TimeoutError:
             if last_progress:
-                try:
-                    await message.edit(last_progress)
-                except Exception:  # pylint: disable=broad-except
-                    pass
+                await message.edit(last_progress)
             continue
 
         kind, payload = item
+
         if kind == "done":
-            return payload, None
-        if kind == "error":
-            return None, payload
-        if kind == "progress":
+            result_link = payload
+            break
+        elif kind == "error":
+            error_msg = payload
+            break
+        elif kind == "progress":
             last_progress = payload
-            try:
-                await message.edit(payload)
-            except Exception:  # pylint: disable=broad-except
-                pass
+            await message.edit(payload)
 
-
-def _resolve_glob_patterns(patterns: List[str], base_dir: Path) -> List[Path]:
-    """Resolve glob patterns. Returns sorted, deduplicated file list."""
-    found = []
-    seen: set = set()
-    for pat in patterns:
-        pat = pat.strip()
-        if not pat:
-            continue
-        p = Path(pat)
-        if p.is_absolute():
-            search_root = Path(p.root)
-            rel = str(p.relative_to(search_root))
-        else:
-            search_root = base_dir
-            rel = str(p)
-
-        if '*' in rel or '?' in rel:
-            for match in sorted(search_root.glob(rel)):
-                if match.is_file() and str(match) not in seen:
-                    seen.add(str(match))
-                    found.append(match)
-        else:
-            candidate = p if p.is_absolute() else base_dir / p
-            if not candidate.exists():
-                candidate = Path(config.Dynamic.DOWN_PATH) / p
-            if candidate.is_file() and str(candidate) not in seen:
-                seen.add(str(candidate))
-                found.append(candidate)
-    return found
+    return result_link, error_msg
 
 
 # ------------------------------------------------------------------
-# Upload command  (.goup)
+# .goup command
 # ------------------------------------------------------------------
 
 @userge.on_cmd("goup", about={
-    'header': "Upload file(s) or folder to GoFile",
+    'header': "Upload file(s) or a folder to GoFile",
     'usage': (
-        "{tr}goup <file_or_folder>\n"
-        "{tr}goup file1.mkv | file2.mkv | *.srt\n"
-        "  (optional 2nd line: GoFile URL, folder code, or internal folder UUID)"
+        "{tr}goup <file_or_folder_path>\n"
+        "{tr}goup <file1> | <file2> | <glob*>         ← multi-file, new folder\n"
+        "{tr}goup <file1> | <glob*>\n"
+        "<gofile_link_or_id>                           ← upload into existing folder"
     ),
     'examples': [
         "{tr}goup video.mkv",
-        "{tr}goup file1.mkv | file2.srt",
-        "{tr}goup *.mkv | *.srt\nhttps://gofile.io/d/MhvUoL",
-        "{tr}goup *.srt\nf2a7a119-d9e7-4eed-909f-4719478db0a4",
+        "{tr}goup /app/downloads/MyShow",
+        "{tr}goup file1.mkv | file2.mkv | *.srt",
+        "{tr}goup *.mkv | *.srt\nhttps://gofile.io/d/AbCdEf",
+        "{tr}goup file.mkv\nAbCdEf",
     ]})
 async def goup_(message: Message):
-    """ upload to GoFile """
+    """ upload file(s) or folder to GoFile """
     if not GOFILE_TOKEN:
         await message.err(
             "Set `GOFILE_TOKEN` environment variable to enable GoFile uploads.")
@@ -598,70 +551,91 @@ async def goup_(message: Message):
 
     raw = message.input_str.strip() if message.input_str else ""
     if not raw:
-        await message.err("Provide a file path, folder path, or file patterns.")
+        await message.err("Provide a file path, folder path, or pipe-separated file patterns.")
         return
 
-    lines = raw.splitlines()
-    file_line = lines[0].strip()
-    existing_folder_line = lines[1].strip() if len(lines) > 1 else ""
+    # ── Parse optional existing-folder specifier ───────────────────────────
+    # If the input has a newline, the second line is treated as a GoFile folder
+    # link or folder ID/share-code to upload into.
+    existing_folder_ref: Optional[str] = None
+    if "\n" in raw:
+        parts = raw.split("\n", 1)
+        raw = parts[0].strip()
+        second_line = parts[1].strip()
+        if second_line:
+            # Accept full URL or bare code/UUID
+            if "gofile.io/d/" in second_line:
+                existing_folder_ref = second_line.rstrip("/").split("/d/")[-1]
+            else:
+                existing_folder_ref = second_line
 
-    # Extract share code or UUID from second line
-    existing_folder_raw: Optional[str] = None
-    if existing_folder_line:
-        if "gofile.io/d/" in existing_folder_line:
-            existing_folder_raw = existing_folder_line.rstrip("/").split("/d/")[-1]
+    # ── Resolve file list ──────────────────────────────────────────────────
+    # Split on "|" to support multiple patterns / paths
+    segments = [s.strip() for s in raw.split("|") if s.strip()]
+
+    srcs: List[Path] = []
+    import glob as _glob  # pylint: disable=import-outside-toplevel
+
+    for seg in segments:
+        # Try as glob first (handles "*" patterns)
+        matches = _glob.glob(seg)
+        if not matches:
+            # Try relative to DOWN_PATH
+            matches = _glob.glob(os.path.join(config.Dynamic.DOWN_PATH, seg))
+        if matches:
+            for m in sorted(matches):
+                p = Path(m)
+                if p.is_file():
+                    srcs.append(p)
         else:
-            existing_folder_raw = existing_folder_line.strip()
+            # Single literal path
+            p = Path(seg)
+            if not p.is_file():
+                p = Path(config.Dynamic.DOWN_PATH) / seg
+            if p.is_file():
+                srcs.append(p)
+            elif p.is_dir():
+                # Entire directory — handled separately below
+                srcs.append(p)
+            else:
+                await message.err(f"Not found: `{seg}`")
+                return
 
-    base_dir = Path(config.Dynamic.DOWN_PATH)
-
-    if "|" not in file_line:
-        src = Path(file_line)
-        if not src.is_absolute():
-            src_candidate = base_dir / file_line
-            if src_candidate.exists():
-                src = src_candidate
-        if src.is_dir():
-            await _goup_folder(message, src, existing_folder_raw=existing_folder_raw)
-            return
-        if src.is_file():
-            await _goup_file(message, src, existing_folder_raw=existing_folder_raw)
-            return
-        files = _resolve_glob_patterns([file_line], base_dir)
-        if not files:
-            await message.err(f"File not found: `{file_line}`")
-            return
-        if len(files) == 1:
-            await _goup_file(message, files[0], existing_folder_raw=existing_folder_raw)
-        else:
-            await _goup_multi(message, files, existing_folder_raw=existing_folder_raw)
+    if not srcs:
+        await message.err("No files matched the given pattern(s).")
         return
 
-    patterns = [p.strip() for p in file_line.split("|")]
-    files = _resolve_glob_patterns(patterns, base_dir)
-    if not files:
-        await message.err("No matching files found.")
+    # ── Single directory → folder upload ──────────────────────────────────
+    if len(srcs) == 1 and srcs[0].is_dir():
+        await _goup_folder(message, srcs[0], existing_folder_ref)
         return
-    if len(files) == 1:
-        await _goup_file(message, files[0], existing_folder_raw=existing_folder_raw)
+
+    # ── One or more files → file upload(s) ────────────────────────────────
+    # Filter out any dirs that slipped through
+    file_srcs = [p for p in srcs if p.is_file()]
+    if not file_srcs:
+        await message.err("No uploadable files found.")
+        return
+
+    if len(file_srcs) == 1 and existing_folder_ref is None:
+        await _goup_file(message, file_srcs[0], existing_folder_ref)
     else:
-        await _goup_multi(message, files, existing_folder_raw=existing_folder_raw)
+        await _goup_multi(message, file_srcs, existing_folder_ref)
 
-
-# ------------------------------------------------------------------
-# Single-file upload
-# ------------------------------------------------------------------
 
 async def _goup_file(
     message: Message,
     src: Path,
-    existing_folder_raw: Optional[str] = None,
+    existing_folder_ref: Optional[str] = None,
 ) -> None:
+    """Upload a single file; optionally into an existing GoFile folder."""
     display_name = src.name
     size = src.stat().st_size
     task_id = f"goup_{display_name}"
 
-    await message.edit(f"`Starting GoFile upload: {display_name} ({humanbytes(size)})`")
+    await message.edit(
+        f"`Starting GoFile upload: {display_name} ({humanbytes(size)})`"
+    )
 
     if _STATUS_AVAILABLE:
         register_task(task_id, display_name, kind="upload")
@@ -674,36 +648,35 @@ async def _goup_file(
             async with aiohttp.ClientSession() as session:
                 server = await _get_best_server(session)
 
-                # Resolve folder code → UUID if needed
-                existing_folder_id: Optional[str] = None
-                if existing_folder_raw:
-                    existing_folder_id = await _resolve_folder_id(session, existing_folder_raw)
+                # Resolve existing folder UUID if provided
+                folder_id: Optional[str] = None
+                if existing_folder_ref:
+                    folder_id = await _resolve_folder_id(session, existing_folder_ref)
 
                 file_data = await _upload_single_file(
                     session, server, src, task_id, size, progress_queue,
-                    folder_id=existing_folder_id,
-                    completed_count=0, total_count=1,
+                    folder_id=folder_id,
                 )
-                folder_code = file_data.get("parentFolderCode") or ""
-                parent_folder_id = file_data.get("parentFolder") or ""
 
-                # Rename auto-created folder to the filename
-                if parent_folder_id and not existing_folder_id:
-                    await _rename_gofile_content(session, parent_folder_id, display_name)
+                # Rename the GoFile folder to match the filename (only for new folders)
+                if not existing_folder_ref:
+                    parent_folder_id = file_data.get("parentFolder")
+                    if parent_folder_id:
+                        await _rename_gofile_content(session, parent_folder_id, display_name)
 
-                if existing_folder_raw:
-                    # Preserve the original share code in the link
-                    link = f"https://gofile.io/d/{existing_folder_raw}"
-                elif folder_code:
-                    link = f"https://gofile.io/d/{folder_code}"
-                else:
-                    link = file_data.get("downloadPage", "")
+                share_code = file_data.get("parentFolderCode") or file_data.get("foldersCode")
+                if not share_code:
+                    # Fall back: extract from downloadPage
+                    dl_page = file_data.get("downloadPage", "")
+                    share_code = dl_page.rstrip("/").split("/d/")[-1] if "/d/" in dl_page else ""
+                link = f"https://gofile.io/d/{share_code}" if share_code else file_data.get("downloadPage", "N/A")
 
             await progress_queue.put(("done", link))
         except Exception as exc:  # pylint: disable=broad-except
             await progress_queue.put(("error", str(exc)))
 
     asyncio.ensure_future(_run())
+
     result_link, error_msg = await _progress_display_loop(message, progress_queue)
     m_s = (datetime.now() - start_t).seconds
 
@@ -724,22 +697,20 @@ async def _goup_file(
     )
 
 
-# ------------------------------------------------------------------
-# Multi-file upload
-# ------------------------------------------------------------------
-
 async def _goup_multi(
     message: Message,
-    files: List[Path],
-    existing_folder_raw: Optional[str] = None,
+    srcs: List[Path],
+    existing_folder_ref: Optional[str] = None,
 ) -> None:
-    total_count = len(files)
-    folder_name = files[0].name
-    total_size = sum(f.stat().st_size for f in files)
+    """Upload multiple files into a single GoFile folder."""
+    total_count = len(srcs)
+    total_size = sum(s.stat().st_size for s in srcs)
+    # Folder name = name of the first file (unless uploading into existing folder)
+    folder_display_name = srcs[0].name
 
     await message.edit(
-        f"`Uploading {total_count} files → GoFile folder '{folder_name}'…`\n"
-        f"`Total: {humanbytes(total_size)}`"
+        f"`Uploading {total_count} file(s) to GoFile "
+        f"({humanbytes(total_size)} total)…`"
     )
 
     progress_queue: asyncio.Queue = asyncio.Queue()
@@ -750,48 +721,53 @@ async def _goup_multi(
             async with aiohttp.ClientSession() as session:
                 server = await _get_best_server(session)
 
-                # Resolve existing folder code → UUID
-                pre_resolved_id: Optional[str] = None
-                if existing_folder_raw:
-                    pre_resolved_id = await _resolve_folder_id(session, existing_folder_raw)
+                # Resolve or create the target folder
+                folder_id: Optional[str] = None
+                if existing_folder_ref:
+                    folder_id = await _resolve_folder_id(session, existing_folder_ref)
+                else:
+                    # Create a new folder named after the first file
+                    folder_id, share_code_holder = await _create_gofile_folder(
+                        session, folder_display_name
+                    )
 
-                target_folder_id: Optional[str] = pre_resolved_id
-                folder_code: Optional[str] = existing_folder_raw  # keep share code for final link
+                final_share_code = None
 
-                for i, src in enumerate(files):
+                for idx, src in enumerate(srcs):
                     task_id = f"goup_{src.name}"
                     if _STATUS_AVAILABLE:
                         register_task(task_id, src.name, kind="upload")
 
                     file_data = await _upload_single_file(
-                        session, server, src, task_id, src.stat().st_size,
-                        progress_queue,
-                        folder_id=target_folder_id,
-                        completed_count=i,
+                        session, server, src, task_id,
+                        src.stat().st_size, progress_queue,
+                        folder_id=folder_id,
+                        completed_count=idx,
                         total_count=total_count,
                     )
 
                     if _STATUS_AVAILABLE:
                         complete_task(task_id)
 
-                    # After first upload, capture the folder ID & code for all subsequent files
-                    if target_folder_id is None:
-                        target_folder_id = file_data.get("parentFolder") or None
-                        folder_code = file_data.get("parentFolderCode") or None
-                        # Rename folder to match first filename
-                        if target_folder_id:
-                            await _rename_gofile_content(session, target_folder_id, folder_name)
+                    if final_share_code is None:
+                        sc = file_data.get("parentFolderCode") or file_data.get("foldersCode")
+                        if not sc:
+                            dl_page = file_data.get("downloadPage", "")
+                            sc = dl_page.rstrip("/").split("/d/")[-1] if "/d/" in dl_page else ""
+                        if sc:
+                            final_share_code = sc
 
-                if folder_code:
-                    link = f"https://gofile.io/d/{folder_code}"
-                else:
-                    link = ""
-
-                await progress_queue.put(("done", link))
+                link = (
+                    f"https://gofile.io/d/{final_share_code}"
+                    if final_share_code
+                    else "N/A"
+                )
+            await progress_queue.put(("done", link))
         except Exception as exc:  # pylint: disable=broad-except
             await progress_queue.put(("error", str(exc)))
 
     asyncio.ensure_future(_run())
+
     result_link, error_msg = await _progress_display_loop(message, progress_queue)
     m_s = (datetime.now() - start_t).seconds
 
@@ -800,37 +776,31 @@ async def _goup_multi(
         return
 
     await message.edit(
-        f"✅ **Uploaded Successfully in {m_s} seconds**\n\n"
-        f"**Files** : `{total_count}`\n"
+        f"✅ **Uploaded {total_count} file(s) Successfully in {m_s} seconds**\n\n"
+        f"**Folder Name** : `{folder_display_name}`\n"
         f"**Total Size** : `{humanbytes(total_size)}`\n"
-        f"**Folder Name** : `{folder_name}`\n"
         f"🔗 **Link** : {result_link}"
     )
 
-
-# ------------------------------------------------------------------
-# Folder upload
-# ------------------------------------------------------------------
 
 async def _goup_folder(
     message: Message,
     src_dir: Path,
-    existing_folder_raw: Optional[str] = None,
+    existing_folder_ref: Optional[str] = None,
 ) -> None:
-    files: List[Path] = sorted(
-        [p for p in src_dir.rglob("*") if p.is_file()],
-        key=lambda p: str(p)
-    )
-    if not files:
-        await message.err(f"Folder `{src_dir.name}` is empty.")
+    """Recursively upload a local folder to GoFile."""
+    all_files = sorted(f for f in src_dir.rglob("*") if f.is_file())
+    if not all_files:
+        await message.err(f"No files found in `{src_dir}`.")
         return
 
-    total_count = len(files)
-    folder_name = src_dir.name
-    total_size = sum(f.stat().st_size for f in files)
+    total_count = len(all_files)
+    total_size = sum(f.stat().st_size for f in all_files)
+    folder_display_name = src_dir.name
 
     await message.edit(
-        f"`Uploading folder '{folder_name}' ({total_count} files, {humanbytes(total_size)})…`"
+        f"`Uploading folder '{folder_display_name}' — "
+        f"{total_count} file(s) ({humanbytes(total_size)})…`"
     )
 
     progress_queue: asyncio.Queue = asyncio.Queue()
@@ -841,75 +811,50 @@ async def _goup_folder(
             async with aiohttp.ClientSession() as session:
                 server = await _get_best_server(session)
 
-                # Resolve existing folder code → UUID
-                pre_resolved_id: Optional[str] = None
-                if existing_folder_raw:
-                    pre_resolved_id = await _resolve_folder_id(session, existing_folder_raw)
+                if existing_folder_ref:
+                    folder_id = await _resolve_folder_id(session, existing_folder_ref)
+                else:
+                    folder_id, _ = await _create_gofile_folder(
+                        session, folder_display_name
+                    )
 
-                root_folder_id: Optional[str] = pre_resolved_id
-                folder_code: Optional[str] = existing_folder_raw
+                final_share_code = None
 
-                folder_cache: dict = {}  # relative path → GoFile UUID
-
-                for i, src in enumerate(files):
-                    rel = src.relative_to(src_dir)
-                    parent_rel = str(rel.parent)
-
-                    if parent_rel == ".":
-                        target_folder_id = root_folder_id
-                    else:
-                        if parent_rel not in folder_cache:
-                            parts = Path(parent_rel).parts
-                            current_rel = "."
-                            for part in parts:
-                                new_rel = os.path.join(current_rel, part)
-                                if new_rel not in folder_cache:
-                                    parent_gf_id = folder_cache.get(current_rel, root_folder_id)
-                                    if parent_gf_id is not None:
-                                        gf_id = await _create_gofile_folder(
-                                            session, parent_gf_id, part)
-                                        folder_cache[new_rel] = gf_id
-                                    else:
-                                        folder_cache[new_rel] = None
-                                current_rel = new_rel
-                        target_folder_id = folder_cache.get(parent_rel)
-
+                for idx, src in enumerate(all_files):
                     task_id = f"goup_{src.name}"
                     if _STATUS_AVAILABLE:
                         register_task(task_id, src.name, kind="upload")
 
                     file_data = await _upload_single_file(
-                        session, server, src, task_id, src.stat().st_size,
-                        progress_queue,
-                        folder_id=target_folder_id,
-                        completed_count=i,
+                        session, server, src, task_id,
+                        src.stat().st_size, progress_queue,
+                        folder_id=folder_id,
+                        completed_count=idx,
                         total_count=total_count,
                     )
 
                     if _STATUS_AVAILABLE:
                         complete_task(task_id)
 
-                    # Bootstrap root folder from first upload
-                    if root_folder_id is None:
-                        root_folder_id = file_data.get("parentFolder") or None
-                        folder_code = file_data.get("parentFolderCode") or None
-                        if root_folder_id and not pre_resolved_id:
-                            await _rename_gofile_content(session, root_folder_id, folder_name)
-                        # Back-fill pending None entries
-                        for k in list(folder_cache.keys()):
-                            if folder_cache[k] is None:
-                                folder_cache[k] = root_folder_id
+                    if final_share_code is None:
+                        sc = file_data.get("parentFolderCode") or file_data.get("foldersCode")
+                        if not sc:
+                            dl_page = file_data.get("downloadPage", "")
+                            sc = dl_page.rstrip("/").split("/d/")[-1] if "/d/" in dl_page else ""
+                        if sc:
+                            final_share_code = sc
 
-                if folder_code:
-                    link = f"https://gofile.io/d/{folder_code}"
-                else:
-                    link = ""
-
-                await progress_queue.put(("done", link))
+                link = (
+                    f"https://gofile.io/d/{final_share_code}"
+                    if final_share_code
+                    else "N/A"
+                )
+            await progress_queue.put(("done", link))
         except Exception as exc:  # pylint: disable=broad-except
             await progress_queue.put(("error", str(exc)))
 
     asyncio.ensure_future(_run())
+
     result_link, error_msg = await _progress_display_loop(message, progress_queue)
     m_s = (datetime.now() - start_t).seconds
 
@@ -918,9 +863,65 @@ async def _goup_folder(
         return
 
     await message.edit(
-        f"✅ **Uploaded Successfully in {m_s} seconds**\n\n"
-        f"**Folder** : `{folder_name}`\n"
+        f"✅ **Folder Uploaded Successfully in {m_s} seconds**\n\n"
+        f"**Folder Name** : `{folder_display_name}`\n"
         f"**Files** : `{total_count}`\n"
         f"**Total Size** : `{humanbytes(total_size)}`\n"
         f"🔗 **Link** : {result_link}"
     )
+
+
+async def _create_gofile_folder(
+    session: aiohttp.ClientSession,
+    folder_name: str,
+) -> tuple:
+    """
+    Create a new GoFile folder under the account root.
+    Returns (folder_id, share_code).
+    """
+    # First we need the account's root folder ID
+    auth_headers = {
+        "Authorization": f"Bearer {GOFILE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    # Get account info to find the root folder ID
+    async with session.get(
+        f"{_GOFILE_BASE}/accounts/getid",
+        headers=auth_headers,
+    ) as resp:
+        acc_info = await resp.json()
+
+    if acc_info.get("status") != "ok":
+        raise RuntimeError(f"GoFile account info failed: {acc_info}")
+
+    account_id = acc_info["data"]["id"]
+
+    async with session.get(
+        f"{_GOFILE_BASE}/accounts/{account_id}",
+        headers=auth_headers,
+    ) as resp:
+        acc_detail = await resp.json()
+
+    if acc_detail.get("status") != "ok":
+        raise RuntimeError(f"GoFile account detail failed: {acc_detail}")
+
+    root_folder_id = acc_detail["data"]["rootFolder"]
+
+    # Create the subfolder
+    payload = {"parentFolderId": root_folder_id, "folderName": folder_name}
+    async with session.post(
+        f"{_GOFILE_BASE}/contents/createFolder",
+        headers=auth_headers,
+        json=payload,
+    ) as resp:
+        folder_resp = await resp.json()
+
+    if folder_resp.get("status") != "ok":
+        raise RuntimeError(f"GoFile folder creation failed: {folder_resp}")
+
+    folder_data = folder_resp["data"]
+    folder_id = folder_data.get("id") or folder_data.get("folderId")
+    share_code = folder_data.get("code") or folder_data.get("folderCode") or ""
+
+    return folder_id, share_code
