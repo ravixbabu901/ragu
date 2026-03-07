@@ -50,7 +50,7 @@ from userge.utils import runcmd
 CHANNEL = userge.getCLogger()
 
 # How often (seconds) the .term live-output line is refreshed in the message.
-_TERM_REFRESH_INTERVAL = 10
+_TERM_REFRESH_INTERVAL = 5
 
 
 def input_checker(func: Callable[[Message], Awaitable[Any]]):
