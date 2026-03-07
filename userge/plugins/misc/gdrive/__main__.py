@@ -368,22 +368,40 @@ class _GDrive:
             self._finish()
 
     def _download_file(self, path: str, name: str, **kwargs) -> None:
-        request = self._service.files().get_media(fileId=kwargs['id'], supportsTeamDrives=True)
-        with io.FileIO(os.path.join(path, name), 'wb') as d_f:
-            d_file_obj = MediaIoBaseDownload(d_f, request, chunksize=_DOWNLOAD_CHUNK)
-            c_time = time.time()
-            done = False
-            while done is False:
-                status, done = d_file_obj.next_chunk(num_retries=5)
-                if self._is_canceled:
-                    raise ProcessCanceled
-                if status:
-                    f_size = status.total_size
+        if self._is_canceled:
+            raise ProcessCanceled
+        file_id = kwargs.get('file_id', '')
+        file_size = kwargs.get('file_size', 0)
+
+        # ── Direct HTTP download via requests.Session ──────────────────────
+        # This is significantly faster than MediaIoBaseDownload + httplib2
+        # because requests uses proper kernel TCP buffers and keep-alive.
+        token = _get_access_token()
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsTeamDrives=true"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        session = _get_dl_session()
+        downloaded = 0
+        c_time = time.time()
+
+        with session.get(url, headers=headers, stream=True, timeout=60) as resp:
+            resp.raise_for_status()
+            if file_size == 0:
+                content_length = resp.headers.get("Content-Length")
+                if content_length:
+                    file_size = int(content_length)
+            with open(path, "wb") as out_file:
+                for chunk in resp.iter_content(chunk_size=_DOWNLOAD_CHUNK):
+                    if self._is_canceled:
+                        raise ProcessCanceled
+                    if not chunk:
+                        continue
+                    out_file.write(chunk)
+                    downloaded += len(chunk)
                     diff = time.time() - c_time or 0.001
-                    downloaded = status.resumable_progress
-                    percentage = downloaded / f_size * 100
                     speed = round(downloaded / diff, 2)
-                    eta = round((f_size - downloaded) / speed) if speed else 0
+                    eta = round((file_size - downloaded) / speed) if speed and file_size > downloaded else 0
+                    percentage = downloaded / file_size * 100 if file_size else 0
                     tmp = \
                         "__Downloading From GDrive...__\n" + \
                         "```\n[{}{}]({}%)```\n" + \
@@ -400,15 +418,12 @@ class _GDrive:
                                  for _ in range(20 - math.floor(percentage / 5)))),
                         round(percentage, 2),
                         name,
-                        humanbytes(f_size),
+                        humanbytes(file_size),
                         humanbytes(downloaded),
                         self._completed,
                         self._list,
                         humanbytes(speed),
                         time_formatter(eta))
-        self._completed += 1
-        _LOG.info(
-            "Downloaded Google-Drive File => Name: %s ID: %s", name, kwargs['id'])
 
     def _list_drive_dir(self, file_id: str) -> list:
         query = f"'{file_id}' in parents and (name contains '*')"
@@ -455,19 +470,36 @@ class _GDrive:
 
     def _download(self, file_id: str) -> None:
         try:
-            drive_file = self._service.files().get(fileId=file_id, fields="id, name, mimeType",
-                                                   supportsTeamDrives=True).execute()
-            if drive_file['mimeType'] == G_DRIVE_DIR_MIME_TYPE:
-                path = self._create_server_dir(config.Dynamic.DOWN_PATH, drive_file['name'])
-                self._download_dir(path, **drive_file)
+            meta = self._service.files().get(
+                fileId=file_id,
+                fields='id, name, mimeType, size',
+                supportsTeamDrives=True).execute()
+            file_name = meta.get('name')
+            mime_type = meta.get('mimeType')
+            file_size = int(meta.get('size', 0))
+
+            if mime_type == G_DRIVE_DIR_MIME_TYPE:
+                # Folder download — recurse
+                self._download_dir(
+                    os.path.join(config.Dynamic.DOWN_PATH, file_name),
+                    file_id=file_id)
+                self._output = os.path.join(config.Dynamic.DOWN_PATH, file_name)
             else:
-                self._download_file(config.Dynamic.DOWN_PATH, **drive_file)
-            self._output = drive_file['name']
+                dest = os.path.join(config.Dynamic.DOWN_PATH, file_name)
+                self._download_file(
+                    dest, file_name,
+                    file_id=file_id,
+                    file_size=file_size)
+                self._output = dest
+
         except HttpError as h_e:
             _LOG.exception(h_e)
             self._output = h_e
         except ProcessCanceled:
             self._output = "`Process Canceled!`"
+        except Exception as e:  # pylint: disable=broad-except
+            _LOG.exception(e)
+            self._output = str(e)
         finally:
             self._finish()
 
@@ -769,7 +801,6 @@ class Worker(_GDrive):
         if isinstance(self._output, HttpError):
             out = f"**ERROR** : `{self._output._get_reason()}`"  # pylint: disable=protected-access
         elif self._output is not None and not self._is_canceled:
-            # Show only the filename — no leading path like /bot/
             file_name = os.path.basename(str(self._output))
             out = f"**Downloaded Successfully** __in {m_s} seconds__\n\n`{file_name}`"
         elif self._output is not None and self._is_canceled:
