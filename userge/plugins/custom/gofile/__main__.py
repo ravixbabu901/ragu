@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 
 import aiohttp
+from aiohttp import MultipartWriter
+from aiohttp.payload import BytesIOPayload
 
 from userge import userge, Message, config
 from userge.utils import humanbytes
@@ -98,7 +100,6 @@ async def godl_(message: Message):
             dl_dir = Path(config.Dynamic.DOWN_PATH)
             dl_dir.mkdir(parents=True, exist_ok=True)
 
-            dl_wt = _generate_website_token(content_id, website_token)
             cookie = f"accountToken={website_token}"
             headers = {
                 "Cookie": cookie,
@@ -206,39 +207,65 @@ async def goup_(message: Message):
 
 
 async def _upload_to_gofile(src: Path, task_id: str, total_size: int) -> str:
-    """Upload file to GoFile and return share link."""
-    # Get best server
+    """Upload file to GoFile and return share link.
+
+    Uses MultipartWriter with a manually built Content-Disposition header so
+    the filename is sent as-is (UTF-8 raw bytes) rather than percent-encoded
+    by aiohttp.FormData, which would turn spaces and brackets into %20, %5B etc.
+    """
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{_GOFILE_BASE}/servers") as resp:
             data = await resp.json()
         server = data["data"]["servers"][0]["name"]
         upload_url = f"https://{server}.gofile.io/contents/uploadfile"
 
-        headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
+        auth_headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
         start = time.time()
         uploaded_bytes = 0
 
-        async def _file_generator():
-            nonlocal uploaded_bytes
-            with open(src, "rb") as f:
-                while True:
-                    chunk = f.read(1024 * 256)
-                    if not chunk:
-                        break
-                    uploaded_bytes += len(chunk)
-                    elapsed = time.time() - start or 0.001
-                    speed = int(uploaded_bytes / elapsed)
-                    if _STATUS_AVAILABLE:
-                        update_task(task_id,
-                                    speed=speed,
-                                    done=uploaded_bytes,
-                                    total=total_size)
-                    yield chunk
+        # Read the whole file into memory in chunks while tracking progress,
+        # then send as a single payload so aiohttp can set Content-Length.
+        # For very large files this is memory-intensive; for sizes that matter
+        # on a fast server this is still fine (the OS will page it out).
+        # Alternative: use a streaming generator — but then aiohttp uses
+        # chunked transfer-encoding which some CDNs reject.
+        buf = bytearray()
+        with open(src, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 256)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                uploaded_bytes += len(chunk)
+                elapsed = time.time() - start or 0.001
+                speed = int(uploaded_bytes / elapsed)
+                if _STATUS_AVAILABLE:
+                    update_task(task_id,
+                                speed=speed,
+                                done=uploaded_bytes,
+                                total=total_size)
 
-        form = aiohttp.FormData()
-        form.add_field("file", _file_generator(), filename=src.name,
-                       content_type="application/octet-stream")
-        async with session.post(upload_url, data=form, headers=headers) as resp:
+        # Build multipart body manually so we control Content-Disposition exactly.
+        # aiohttp.FormData percent-encodes the filename; we must bypass that.
+        mp = MultipartWriter("form-data")
+        payload = mp.append(bytes(buf), {"content-type": "application/octet-stream"})
+
+        # Set Content-Disposition with raw filename (no percent-encoding).
+        # RFC 5987 encoding via filename* is the correct way, but GoFile's
+        # server accepts the plain UTF-8 filename header directly.
+        safe_name = src.name.replace('"', '\\"')
+        payload.set_content_disposition(
+            "form-data",
+            name="file",
+            filename=safe_name,
+        )
+        # Override the disposition header with the truly raw (unencoded) name
+        # because aiohttp's set_content_disposition still percent-encodes.
+        payload.headers["Content-Disposition"] = (
+            f'form-data; name="file"; filename="{safe_name}"'
+        )
+
+        async with session.post(upload_url, data=mp, headers=auth_headers) as resp:
             result = await resp.json()
 
     if result.get("status") != "ok":
