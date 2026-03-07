@@ -13,7 +13,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import stagger
+# stagger is optional — used only for audio album-art extraction.
+# If the package isn't installed, audio uploads still work, just without
+# embedded cover-art extraction.
+try:
+    import stagger as _stagger
+    _STAGGER_OK = True
+except ImportError:
+    _stagger = None  # type: ignore
+    _STAGGER_OK = False
+
 from PIL import Image
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
@@ -49,37 +58,38 @@ async def upload_path(message: Message, path: Path, del_path: bool):
     for p_t in file_paths:
         current += 1
         try:
-            # Pass total so finalize knows whether to show the "Uploaded in X s" edit
-            await upload(message, p_t, del_path, f"{current}/{total}", _total=total)
+            await upload(message, p_t, del_path, f"{current}/{total}")
         except FloodWait as f_e:
-            await asyncio.sleep(f_e.value)   # use async sleep — don't block event loop
+            # Use async sleep — blocking sleep would freeze the entire event loop
+            await asyncio.sleep(f_e.value)
         if message.process_is_canceled:
             break
-        # Yield to the event loop between files so the next upload starts immediately
+        # Yield to the event loop so the next upload starts immediately
+        # (avoids the 10-second del_in hold blocking the loop in multi-file uploads)
         await asyncio.sleep(0)
 
 
 async def upload(message: Message, path: Path, del_path: bool = False,
-                 extra: str = '', with_thumb: bool = True, _total: int = 1):
+                 extra: str = '', with_thumb: bool = True):
     if 'wt' in message.flags:
         with_thumb = False
     if 'r' in message.flags:
         del_path = True
     if path.name.lower().endswith(
             (".mkv", ".mp4", ".webm", ".m4v")) and ('d' not in message.flags):
-        await vid_upload(message, path, del_path, extra, with_thumb, _total=_total)
+        await vid_upload(message, path, del_path, extra, with_thumb)
     elif path.name.lower().endswith(
             (".mp3", ".flac", ".wav", ".m4a")) and ('d' not in message.flags):
-        await audio_upload(message, path, del_path, extra, with_thumb, _total=_total)
+        await audio_upload(message, path, del_path, extra, with_thumb)
     elif path.name.lower().endswith(
             (".jpg", ".jpeg", ".png", ".bmp")) and ('d' not in message.flags):
-        await photo_upload(message, path, del_path, extra, _total=_total)
+        await photo_upload(message, path, del_path, extra)
     else:
-        await doc_upload(message, path, del_path, extra, with_thumb, _total=_total)
+        await doc_upload(message, path, del_path, extra, with_thumb)
 
 
 async def doc_upload(message: Message, path, del_path: bool = False,
-                     extra: str = '', with_thumb: bool = True, _total: int = 1):
+                     extra: str = '', with_thumb: bool = True):
     str_path = str(path)
     sent: Message = await message.client.send_message(
         message.chat.id, f"`Uploading {str_path} as a doc ... {extra}`")
@@ -105,13 +115,13 @@ async def doc_upload(message: Message, path, del_path: bool = False,
         raise u_e
     else:
         await sent.delete()
-        await finalize(message, msg, start_t, _total=_total)
+        await finalize(message, msg, start_t)
         if os.path.exists(str_path) and del_path:
             os.remove(str_path)
 
 
 async def vid_upload(message: Message, path, del_path: bool = False,
-                     extra: str = '', with_thumb: bool = True, _total: int = 1):
+                     extra: str = '', with_thumb: bool = True):
     str_path = str(path)
     thumb = await get_thumb(str_path) if with_thumb else None
     duration = 0
@@ -152,32 +162,32 @@ async def vid_upload(message: Message, path, del_path: bool = False,
     else:
         await sent.delete()
         await remove_thumb(thumb)
-        await finalize(message, msg, start_t, _total=_total)
+        await finalize(message, msg, start_t)
         if os.path.exists(str_path) and del_path:
             os.remove(str_path)
 
 
 async def audio_upload(message: Message, path, del_path: bool = False,
-                       extra: str = '', with_thumb: bool = True, _total: int = 1):
+                       extra: str = '', with_thumb: bool = True):
     title = None
     artist = None
     thumb = None
     duration = 0
     str_path = str(path)
     file_size = humanbytes(os.stat(str_path).st_size)
-    if with_thumb:
+    if with_thumb and _STAGGER_OK:
         try:
-            album_art = stagger.read_tag(str_path)
+            album_art = _stagger.read_tag(str_path)
             if album_art.picture and not os.path.lexists(thumbnail.Dynamic.THUMB_PATH):
-                bytes_pic_data = album_art[stagger.id3.APIC][0].data
+                bytes_pic_data = album_art[_stagger.id3.APIC][0].data
                 bytes_io = io.BytesIO(bytes_pic_data)
                 image_file = Image.open(bytes_io)
                 image_file.save("album_cover.jpg", "JPEG")
                 thumb = "album_cover.jpg"
-        except stagger.errors.NoTagError:
+        except Exception:  # pylint: disable=broad-except
             pass
-        if not thumb:
-            thumb = await get_thumb(str_path)
+    if not thumb and with_thumb:
+        thumb = await get_thumb(str_path)
     metadata = extractMetadata(createParser(str_path))
     if metadata and metadata.has("title"):
         title = metadata.get("title")
@@ -210,7 +220,7 @@ async def audio_upload(message: Message, path, del_path: bool = False,
         raise u_e
     else:
         await sent.delete()
-        await finalize(message, msg, start_t, _total=_total)
+        await finalize(message, msg, start_t)
         if os.path.exists(str_path) and del_path:
             os.remove(str_path)
     finally:
@@ -218,8 +228,7 @@ async def audio_upload(message: Message, path, del_path: bool = False,
             os.remove("album_cover.jpg")
 
 
-async def photo_upload(message: Message, path, del_path: bool = False,
-                       extra: str = '', _total: int = 1):
+async def photo_upload(message: Message, path, del_path: bool = False, extra: str = ''):
     str_path = str(path)
     sent: Message = await message.client.send_message(
         message.chat.id, f"`Uploading {path.name} as photo ... {extra}`")
@@ -242,7 +251,7 @@ async def photo_upload(message: Message, path, del_path: bool = False,
         raise u_e
     else:
         await sent.delete()
-        await finalize(message, msg, start_t, _total=_total)
+        await finalize(message, msg, start_t)
         if os.path.exists(str_path) and del_path:
             os.remove(str_path)
 
@@ -279,7 +288,7 @@ async def remove_thumb(thumb: str) -> None:
         os.remove(thumb)
 
 
-async def finalize(message: Message, msg: Message, start_t, _total: int = 1):
+async def finalize(message: Message, msg: Message, start_t):
     if 'df' not in message.flags:
         await CHANNEL.fwd_msg(msg)
     await message.client.send_chat_action(message.chat.id, enums.ChatAction.CANCEL)
@@ -288,11 +297,4 @@ async def finalize(message: Message, msg: Message, start_t, _total: int = 1):
     else:
         end_t = datetime.now()
         m_s = (end_t - start_t).seconds
-        # For multi-file uploads: don't use del_in — it holds a 10s async sleep
-        # that blocks the loop from starting the next file immediately.
-        # Just edit without auto-delete; the next file's "Uploading..." message
-        # naturally overwrites it.
-        if _total > 1:
-            await message.edit(f"Uploaded in {m_s} seconds")
-        else:
-            await message.edit(f"Uploaded in {m_s} seconds", del_in=10)
+        await message.edit(f"Uploaded in {m_s} seconds", del_in=10)
