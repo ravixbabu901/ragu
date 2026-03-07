@@ -14,8 +14,6 @@ from datetime import datetime
 from pathlib import Path
 
 # stagger is optional — used only for audio album-art extraction.
-# If the package isn't installed, audio uploads still work, just without
-# embedded cover-art extraction.
 try:
     import stagger as _stagger
     _STAGGER_OK = True
@@ -31,11 +29,30 @@ from pyrogram import enums
 
 from userge import userge, Message
 from userge.utils import progress, take_screen_shot, humanbytes, sort_file_name_key
-from .. import thumbnail
+
+# thumbnail plugin is optional — some deployments don't have it.
+try:
+    from .. import thumbnail as _thumbnail
+    _THUMBNAIL_OK = True
+except ImportError:
+    _thumbnail = None  # type: ignore
+    _THUMBNAIL_OK = False
 
 CHANNEL = userge.getCLogger(__name__)
-
 LOGO_PATH = 'resources/userge.png'
+
+# Default thumbnail path — empty string means "no saved thumbnail"
+_THUMB_PATH = ""
+
+
+def _get_thumb_path() -> str:
+    """Return the saved thumbnail path if available."""
+    if _THUMBNAIL_OK and _thumbnail is not None:
+        try:
+            return _thumbnail.Dynamic.THUMB_PATH
+        except Exception:  # pylint: disable=broad-except
+            pass
+    return _THUMB_PATH
 
 
 async def upload_path(message: Message, path: Path, del_path: bool):
@@ -60,12 +77,9 @@ async def upload_path(message: Message, path: Path, del_path: bool):
         try:
             await upload(message, p_t, del_path, f"{current}/{total}")
         except FloodWait as f_e:
-            # Use async sleep — blocking sleep would freeze the entire event loop
             await asyncio.sleep(f_e.value)
         if message.process_is_canceled:
             break
-        # Yield to the event loop so the next upload starts immediately
-        # (avoids the 10-second del_in hold blocking the loop in multi-file uploads)
         await asyncio.sleep(0)
 
 
@@ -175,10 +189,11 @@ async def audio_upload(message: Message, path, del_path: bool = False,
     duration = 0
     str_path = str(path)
     file_size = humanbytes(os.stat(str_path).st_size)
-    if with_thumb and _STAGGER_OK:
+    if with_thumb and _STAGGER_OK and _stagger is not None:
         try:
             album_art = _stagger.read_tag(str_path)
-            if album_art.picture and not os.path.lexists(thumbnail.Dynamic.THUMB_PATH):
+            thumb_path = _get_thumb_path()
+            if album_art.picture and not os.path.lexists(thumb_path):
                 bytes_pic_data = album_art[_stagger.id3.APIC][0].data
                 bytes_io = io.BytesIO(bytes_pic_data)
                 image_file = Image.open(bytes_io)
@@ -257,8 +272,9 @@ async def photo_upload(message: Message, path, del_path: bool = False, extra: st
 
 
 async def get_thumb(path: str = ''):
-    if os.path.exists(thumbnail.Dynamic.THUMB_PATH):
-        return thumbnail.Dynamic.THUMB_PATH
+    saved = _get_thumb_path()
+    if saved and os.path.exists(saved):
+        return saved
     if path:
         types = (".jpg", ".webp", ".png")
         if path.endswith(types):
@@ -283,8 +299,9 @@ async def get_thumb(path: str = ''):
 
 
 async def remove_thumb(thumb: str) -> None:
+    saved = _get_thumb_path()
     if (thumb and os.path.exists(thumb)
-            and thumb != LOGO_PATH and thumb != thumbnail.Dynamic.THUMB_PATH):
+            and thumb != LOGO_PATH and thumb != saved):
         os.remove(thumb)
 
 
