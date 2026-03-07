@@ -20,6 +20,7 @@ import traceback
 from contextlib import contextmanager
 from enum import Enum
 from getpass import getuser
+from shutil import which
 from typing import Awaitable, Any, Callable, Dict, Optional, Tuple, Iterable
 
 import aiofiles
@@ -49,8 +50,8 @@ from userge.utils import runcmd
 
 CHANNEL = userge.getCLogger()
 
-# How often (seconds) the .term live-output line is refreshed in the message.
-_TERM_REFRESH_INTERVAL = 5
+# Interval (seconds) between live message edits while .term is running
+_TERM_LIVE_INTERVAL = 5
 
 
 def input_checker(func: Callable[[Message], Awaitable[Any]]):
@@ -287,20 +288,28 @@ async def term_(message: Message):
 
     with message.cancel_callback(t_obj.cancel):
         await t_obj.init()
+        prev_line = ""
         while not t_obj.finished:
-            # Show only the last stdout/stderr line, refreshed every 10 seconds.
-            # t_obj.line always holds the most recent line received.
+            # Sleep a fixed 10 seconds — do NOT use t_obj.wait() here because
+            # that future resolves on every new output line, causing the loop
+            # to spin hundreds of times per second and hitting Telegram flood limits.
+            await asyncio.sleep(_TERM_LIVE_INTERVAL)
+            if t_obj.finished:
+                break
             last_line = t_obj.line
-            await message.edit(
-                f"{output}<pre>{last_line}</pre>",
-                parse_mode=enums.ParseMode.HTML
-            )
-            await t_obj.wait(_TERM_REFRESH_INTERVAL)
+            # Only edit if the last line actually changed since last tick
+            if last_line != prev_line:
+                await message.edit(
+                    f"{output}<pre>{last_line}</pre>",
+                    parse_mode=enums.ParseMode.HTML)
+                prev_line = last_line
         if t_obj.cancelled:
             await message.canceled(reply=True)
             return
 
-    out_data = f"{output}<pre>{t_obj.output}</pre>\n{prefix}"
+    ret_code = t_obj.return_code
+    rc_str = f"\n<b>Exit code:</b> <code>{ret_code}</code>" if ret_code is not None else ""
+    out_data = f"{output}<pre>{t_obj.output}</pre>\n{prefix}{rc_str}"
     await message.edit_or_send_as_file(
         out_data, as_raw=as_raw, parse_mode=enums.ParseMode.HTML,
         filename="term.txt", caption=cmd)
@@ -452,6 +461,10 @@ class Term:
     def return_code(self) -> Optional[int]:
         return self._return_code
 
+    def tail_lines(self, n: int) -> str:
+        lines = self._output.decode('utf-8', 'replace').splitlines()
+        return '\n'.join(lines[-n:]).strip()
+
     async def init(self) -> None:
         await self._init.wait()
 
@@ -476,9 +489,12 @@ class Term:
     async def execute(cls, cmd: str) -> 'Term':
         kwargs = dict(
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
+            stderr=asyncio.subprocess.PIPE,
+            cwd=config.Dynamic.DOWN_PATH)
         if setsid:
             kwargs['preexec_fn'] = setsid
+        if sh := which(os.environ.get("USERGE_SHELL", "bash")):
+            kwargs['executable'] = sh
         process = await asyncio.create_subprocess_shell(cmd, **kwargs)
         t_obj = cls(process)
         t_obj._start()
