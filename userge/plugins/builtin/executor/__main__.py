@@ -49,6 +49,9 @@ from userge.utils import runcmd
 
 CHANNEL = userge.getCLogger()
 
+# How often (seconds) the .term live-output line is refreshed in the message.
+_TERM_REFRESH_INTERVAL = 10
+
 
 def input_checker(func: Callable[[Message], Awaitable[Any]]):
     async def wrapper(message: Message) -> None:
@@ -285,15 +288,22 @@ async def term_(message: Message):
     with message.cancel_callback(t_obj.cancel):
         await t_obj.init()
         while not t_obj.finished:
-            await message.edit(f"{output}<pre>{t_obj.line}</pre>", parse_mode=enums.ParseMode.HTML)
-            await t_obj.wait(config.Dynamic.EDIT_SLEEP_TIMEOUT)
+            # Show only the last stdout/stderr line, refreshed every 10 seconds.
+            # t_obj.line always holds the most recent line received.
+            last_line = t_obj.line
+            await message.edit(
+                f"{output}<pre>{last_line}</pre>",
+                parse_mode=enums.ParseMode.HTML
+            )
+            await t_obj.wait(_TERM_REFRESH_INTERVAL)
         if t_obj.cancelled:
             await message.canceled(reply=True)
             return
 
     out_data = f"{output}<pre>{t_obj.output}</pre>\n{prefix}"
     await message.edit_or_send_as_file(
-        out_data, as_raw=as_raw, parse_mode=enums.ParseMode.HTML, filename="term.txt", caption=cmd)
+        out_data, as_raw=as_raw, parse_mode=enums.ParseMode.HTML,
+        filename="term.txt", caption=cmd)
 
 
 def parse_py_template(cmd: str, msg: Message):
