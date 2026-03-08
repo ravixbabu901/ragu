@@ -6,8 +6,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     gcc \
     aria2 \
-    ffmpeg \
-    git \
     curl \
     wget \
     zip \
@@ -31,30 +29,17 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+COPY --from=cwhuntx/ffmpeg:latest /ffmpeg /usr/bin/
 
-# create app and an empty dir for interactive shells, non-root user
-RUN mkdir -p /app /empty /app/downloads \
-    && addgroup --system appgroup \
-    && adduser --system --ingroup appgroup ragu \
-    && chown -R ragu:appgroup /app /empty /app/downloads
+WORKDIR /app
 
-# copy application code into /app
-COPY . /app
-
-# install Python deps
+COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
-    pip install --no-cache-dir -r /app/requirements.txt
+    pip install --no-cache-dir -r requirements.txt
+RUN mkdir -p /app/logs /home
 
-# default working dir for interactive shells -> empty (so `ls` shows empty)
-WORKDIR /empty
+WORKDIR /home
 
-USER ragu
+COPY userge ./userge
 
-# use a small entrypoint that runs the bot from /app (keeps interactive shell in /empty)
-COPY entrypoint.sh /app/entrypoint.sh
-RUN mkdir -p /app/logs
-
-# start the bot (the correct Python module is `userge` in this repo)
-CMD ["bash", "/app/entrypoint.sh"]
+CMD ["python", "-m", "userge"]
