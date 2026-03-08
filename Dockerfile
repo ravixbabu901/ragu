@@ -34,18 +34,27 @@ RUN mkdir -p /etc/apt/keyrings \
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-RUN mkdir -p /app /bot \
+# create app and an empty dir for interactive shells, non-root user
+RUN mkdir -p /app /empty /app/downloads \
     && addgroup --system appgroup \
     && adduser --system --ingroup appgroup ragu \
-    && chown -R ragu:appgroup /app /bot
+    && chown -R ragu:appgroup /app /empty /app/downloads
 
+# copy application code into /app
 COPY . /app
 
+# install Python deps
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r /app/requirements.txt
 
-WORKDIR /bot
+# default working dir for interactive shells -> empty (so `ls` shows empty)
+WORKDIR /empty
 
 USER ragu
 
-CMD ["sh", "-c", "python -m ragu"]
+# use a small entrypoint that runs the bot from /app (keeps interactive shell in /empty)
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# start the bot (the correct Python module is `userge` in this repo)
+CMD ["/app/entrypoint.sh"]
