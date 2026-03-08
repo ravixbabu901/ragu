@@ -38,14 +38,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy userge to /app
-COPY userge ./userge
-RUN mkdir -p /home /app/logs
+# Create /bot and symlink userge there
+RUN mkdir -p /bot /home /app/logs
 
-# Set working directory to an empty folder
+COPY userge /app/userge
+RUN ln -s /app/userge /bot/userge
+
 WORKDIR /bot
-
-# Add /app to PYTHONPATH so Python can find the userge module
-ENV PYTHONPATH="/app:${PYTHONPATH}"
 
 CMD ["python", "-m", "userge"]
