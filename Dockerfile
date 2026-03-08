@@ -32,19 +32,17 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Put everything in /usr/src/app (system location, not user-facing)
+WORKDIR /usr/src/app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY userge ./userge
-RUN mkdir -p /home /app/logs /bot
+RUN mkdir -p /home /downloads /app/logs
 
-# Create a startup script that changes to /bot but runs from /app context
-RUN echo '#!/bin/bash\ncd /bot\nexec python -m userge' > /app/start.sh && \
-    chmod +x /app/start.sh
+# Set working directory to /downloads - this is empty and user-facing
+WORKDIR /downloads
 
-WORKDIR /app
-
-CMD ["/app/start.sh"]
+CMD ["python", "-m", "userge"]
