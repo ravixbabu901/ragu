@@ -38,9 +38,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-WORKDIR /bot
-
+# Copy userge to /app instead of /bot
 COPY userge ./userge
 RUN mkdir -p /home /app/logs
+
+# Set working directory to an empty folder for user operations
+WORKDIR /bot
 
 CMD ["python", "-m", "userge"]
