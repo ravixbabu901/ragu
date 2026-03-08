@@ -54,6 +54,7 @@ USER ragu
 
 # use a small entrypoint that runs the bot from /app (keeps interactive shell in /empty)
 COPY entrypoint.sh /app/entrypoint.sh
+RUN mkdir -p /app/logs
 
 # start the bot (the correct Python module is `userge` in this repo)
 CMD ["bash", "/app/entrypoint.sh"]
