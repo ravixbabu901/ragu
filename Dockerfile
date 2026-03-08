@@ -38,12 +38,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-# Create /bot and symlink userge there
-RUN mkdir -p /bot /home /app/logs
+COPY userge ./userge
+RUN mkdir -p /home /app/logs /bot
 
-COPY userge /app/userge
-RUN ln -s /app/userge /bot/userge
+# Create a startup script that changes to /bot but runs from /app context
+RUN echo '#!/bin/bash\ncd /bot\nexec python -m userge' > /app/start.sh && \
+    chmod +x /app/start.sh
 
-WORKDIR /bot
+WORKDIR /app
 
-CMD ["python", "-m", "userge"]
+CMD ["/app/start.sh"]
