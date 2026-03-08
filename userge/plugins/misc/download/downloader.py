@@ -26,6 +26,35 @@ from userge.utils import progress, humanbytes, extract_entities
 from userge.utils.exceptions import ProcessCanceled
 
 
+def _get_media_filename(to_download: PyroMessage) -> str:
+    """
+    Return the best available filename for a Pyrogram media message.
+    Tries document.file_name first, then falls back to photo/video/audio
+    attributes, then to a generic name derived from the media type.
+    """
+    media = (
+        to_download.document
+        or to_download.video
+        or to_download.audio
+        or to_download.voice
+        or to_download.video_note
+        or to_download.sticker
+        or to_download.animation
+    )
+    if media:
+        # document and audio carry a file_name attribute
+        fname = getattr(media, "file_name", None)
+        if fname:
+            return fname
+        # Build a fallback like "video_<id>.mp4"
+        mime = getattr(media, "mime_type", "")
+        ext = mime.split("/")[-1] if mime else "bin"
+        return f"{to_download.media.value}_{media.file_unique_id}.{ext}"
+    if to_download.photo:
+        return f"photo_{to_download.photo.file_unique_id}.jpg"
+    return f"media_{to_download.id}"
+
+
 async def handle_download(message: Message, resource: Union[Message, str],
                           from_url: bool = False) -> Tuple[str, int]:
     """ download from resource """
@@ -116,7 +145,9 @@ async def url_download(message: Message, url: str) -> Tuple[str, int]:
             await asyncio.sleep(config.Dynamic.EDIT_SLEEP_TIMEOUT)
     if message.process_is_canceled:
         raise ProcessCanceled
-    return dl_loc, (datetime.now() - start_t).seconds
+    # SmartDL may have followed redirects and saved to a different path
+    final_path = downloader.get_dest()
+    return final_path or dl_loc, (datetime.now() - start_t).seconds
 
 
 async def tg_download(
@@ -137,17 +168,32 @@ async def tg_download(
         return dumps(dl_loc), mite
     await message.edit("`Downloading From TG...`")
     start_t = datetime.now()
-    custom_file_name = config.Dynamic.DOWN_PATH
-    if message.filtered_input_str and not from_url:
-        custom_file_name = os.path.join(
-            config.Dynamic.DOWN_PATH,
-            message.filtered_input_str.strip()
+
+    # Determine the save path:
+    #   1. Explicit custom name via "|" syntax  →  DOWN_PATH/custom_name
+    #   2. Explicit name as input (no "|")      →  DOWN_PATH/input_name
+    #   3. No input (or called from_url)        →  DOWN_PATH/real_media_filename
+    #      (passing the full path prevents Pyrogram from using "bot.temp")
+    filtered = message.filtered_input_str or ""
+    if "|" in filtered and not from_url:
+        _, c_file_name = filtered.split("|", maxsplit=1)
+        c_file_name = c_file_name.strip()
+        custom_file_name = (
+            os.path.join(config.Dynamic.DOWN_PATH, c_file_name)
+            if c_file_name
+            else os.path.join(config.Dynamic.DOWN_PATH, _get_media_filename(to_download))
         )
-    elif "|" in message.filtered_input_str:
-        _, c_file_name = message.filtered_input_str.split("|", maxsplit=1)
-        if c_file_name:
-            custom_file_name = os.path.join(
-                config.Dynamic.DOWN_PATH, c_file_name.strip())
+    elif filtered and not from_url:
+        custom_file_name = os.path.join(
+            config.Dynamic.DOWN_PATH, filtered.strip()
+        )
+    else:
+        # Key fix: supply the full file path including the real filename so
+        # Pyrogram does NOT fall back to "bot.temp"
+        custom_file_name = os.path.join(
+            config.Dynamic.DOWN_PATH, _get_media_filename(to_download)
+        )
+
     with message.cancel_callback():
         dl_loc = await message.client.download_media(
             message=to_download,

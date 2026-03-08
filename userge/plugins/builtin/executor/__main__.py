@@ -50,6 +50,9 @@ from userge.utils import runcmd
 
 CHANNEL = userge.getCLogger()
 
+# Interval (seconds) between live message edits while .term is running
+_TERM_LIVE_INTERVAL = 10
+
 
 def input_checker(func: Callable[[Message], Awaitable[Any]]):
     async def wrapper(message: Message) -> None:
@@ -285,12 +288,18 @@ async def term_(message: Message):
 
     with message.cancel_callback(t_obj.cancel):
         await t_obj.init()
+        prev_line = ""
         while not t_obj.finished:
-            tail = t_obj.tail_lines(30)
-            await message.edit(
-                f"{output}<pre>{tail}</pre>",
-                parse_mode=enums.ParseMode.HTML)
-            await t_obj.wait(config.Dynamic.EDIT_SLEEP_TIMEOUT)
+            await asyncio.sleep(_TERM_LIVE_INTERVAL)
+            if t_obj.finished:
+                break
+            # t_obj.line holds the last non-empty segment split on \r or \n
+            last_line = t_obj.line
+            if last_line and last_line != prev_line:
+                await message.edit(
+                    f"{output}<pre>{last_line}</pre>",
+                    parse_mode=enums.ParseMode.HTML)
+                prev_line = last_line
         if t_obj.cancelled:
             await message.canceled(reply=True)
             return
@@ -299,7 +308,8 @@ async def term_(message: Message):
     rc_str = f"\n<b>Exit code:</b> <code>{ret_code}</code>" if ret_code is not None else ""
     out_data = f"{output}<pre>{t_obj.output}</pre>\n{prefix}{rc_str}"
     await message.edit_or_send_as_file(
-        out_data, as_raw=as_raw, parse_mode=enums.ParseMode.HTML, filename="term.txt", caption=cmd)
+        out_data, as_raw=as_raw, parse_mode=enums.ParseMode.HTML,
+        filename="term.txt", caption=cmd)
 
 
 def parse_py_template(cmd: str, msg: Message):
@@ -414,8 +424,8 @@ class Term:
 
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self._process = process
-        self._line = b''
-        self._output = b''
+        self._line = b''       # last complete segment (split on \r or \n)
+        self._output = b''     # full raw output for final display
         self._init = asyncio.Event()
         self._is_init = False
         self._cancelled = False
@@ -426,11 +436,20 @@ class Term:
 
     @property
     def line(self) -> str:
+        """Last non-empty output segment (works for both \n and \r lines)."""
         return self._by_to_str(self._line)
 
     @property
     def output(self) -> str:
-        return self._by_to_str(self._output)
+        """Full output with \r sequences collapsed for clean final display."""
+        raw = self._output.decode('utf-8', 'replace')
+        # Collapse \r-only lines: keep only the last segment per \r group
+        lines = []
+        for part in raw.split('\n'):
+            # Within a \n-terminated line, \r moves cursor back — keep last segment
+            segments = part.split('\r')
+            lines.append(segments[-1])
+        return '\n'.join(lines).strip()
 
     @staticmethod
     def _by_to_str(data: bytes) -> str:
@@ -449,8 +468,7 @@ class Term:
         return self._return_code
 
     def tail_lines(self, n: int) -> str:
-        lines = self._output.decode('utf-8', 'replace').splitlines()
-        return '\n'.join(lines[-n:]).strip()
+        return '\n'.join(self.output.splitlines()[-n:])
 
     async def init(self) -> None:
         await self._init.wait()
@@ -504,16 +522,50 @@ class Term:
         await self._read(self._process.stderr)
 
     async def _read(self, reader: asyncio.StreamReader) -> None:
+        """
+        Read in raw chunks and split on BOTH \\n and \\r.
+        This is essential for programs like mkvmerge that use \\r to
+        overwrite a progress line in place — readline() would block
+        until \\n arrives (which only happens at the very end).
+        """
+        buf = b''
         while True:
-            line = await reader.readline()
-            if not line:
+            try:
+                chunk = await reader.read(4096)
+            except Exception:  # pylint: disable=broad-except
                 break
-            self._append(line)
+            if not chunk:
+                break
+            buf += chunk
+            # Split on \n and \r — process every complete segment
+            # A segment ends at \n or \r; the remainder stays in buf
+            # until the next chunk arrives.
+            while True:
+                nl = buf.find(b'\n')
+                cr = buf.find(b'\r')
+                if nl == -1 and cr == -1:
+                    break  # no separator yet, wait for more data
+                # Pick whichever separator comes first
+                if nl == -1:
+                    sep = cr
+                elif cr == -1:
+                    sep = nl
+                else:
+                    sep = min(nl, cr)
+                segment = buf[:sep]
+                buf = buf[sep + 1:]
+                if segment:          # ignore empty segments (e.g. \r\n pairs)
+                    self._append(segment)
+        # Flush anything left in the buffer when the stream closes
+        if buf.strip():
+            self._append(buf)
 
     def _append(self, line: bytes) -> None:
         self._line = line
-        self._output += line
+        self._output += line + b'\n'
         self._check_init()
+        if not self._listener.done():
+            self._listener.set_result(None)
 
     def _check_init(self) -> None:
         if self._is_init:

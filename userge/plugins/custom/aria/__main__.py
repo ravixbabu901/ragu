@@ -2,7 +2,6 @@
 # Aria plugin for Userge
 # inspired by https://github.com/jaskaranSM/UniBorg/blob/6d35cf452bce1204613929d4da7530058785b6b1/stdplugins/aria.py
 
-
 from asyncio import sleep
 from userge import userge, config as Config, Message
 import math
@@ -11,9 +10,16 @@ from pathlib import Path
 from subprocess import PIPE, Popen
 from requests import get
 from userge.utils import progress, humanbytes
-from userge.plugins.misc.upload import upload_path
 import aria2p
-from fishhook import hook
+
+# upload_path depends on the upload plugin which requires stagger.
+# Import it lazily so aria loads even when upload plugin isn't available.
+try:
+    from userge.plugins.misc.upload import upload_path
+    _UPLOAD_OK = True
+except Exception:  # pylint: disable=broad-except
+    _UPLOAD_OK = False
+    upload_path = None  # type: ignore
 
 try:
     from userge.plugins.custom.status import (
@@ -24,6 +30,7 @@ except Exception:  # pylint: disable=broad-except
 
 LOGS = userge.getLogger(__name__)
 
+
 def subprocess_run(cmd):
     subproc = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True, universal_newlines=True)
     talk = subproc.communicate()
@@ -32,39 +39,41 @@ def subprocess_run(cmd):
         return
     return talk
 
-def rreplace(myStr):
-    return myStr[::-1].replace("/","",1)[::-1]
 
-#DOWN_PATH = rreplace(Config.Dynamic.DOWN_PATH)
+def rreplace(myStr):
+    return myStr[::-1].replace("/", "", 1)[::-1]
+
 
 def aria_start():
     trackers_list = get(
-    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
-).text.replace("\n\n", ",")
+        "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+    ).text.replace("\n\n", ",")
     trackers = f"[{trackers_list}]"
-    cmd = f"aria2c \
-          --enable-rpc \
-          --rpc-listen-all=false \
-          --rpc-listen-port=6800 \
-          --max-connection-per-server=10 \
-          --rpc-max-request-size=1024M \
-          --check-certificate=false \
-          --follow-torrent=mem \
-          --seed-time=0 \
-          --max-upload-limit=1K \
-          --max-concurrent-downloads=5 \
-          --min-split-size=10M \
-          --follow-torrent=mem \
-          --split=10 \
-          --bt-tracker={trackers} \
-          --daemon=true \
-          --allow-overwrite=true"
-    process = subprocess_run(cmd)
+    cmd = (
+        f"aria2c "
+        f"--enable-rpc "
+        f"--rpc-listen-all=false "
+        f"--rpc-listen-port=6800 "
+        f"--max-connection-per-server=10 "
+        f"--rpc-max-request-size=1024M "
+        f"--check-certificate=false "
+        f"--follow-torrent=mem "
+        f"--seed-time=0 "
+        f"--max-upload-limit=1K "
+        f"--max-concurrent-downloads=5 "
+        f"--min-split-size=10M "
+        f"--split=10 "
+        f"--bt-tracker={trackers} "
+        f"--daemon=true "
+        f"--allow-overwrite=true"
+    )
+    subprocess_run(cmd)
     aria2 = aria2p.API(
         aria2p.Client(host="http://localhost", port=6800, secret="")
     )
     return aria2
-    
+
+
 aria2p_client = aria_start()
 
 
@@ -83,7 +92,7 @@ async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # 
     while not complete:
         try:
             t_file = aria2p_client.get_download(gid)
-        except:
+        except Exception:  # pylint: disable=broad-except
             if _STATUS_AVAILABLE:
                 remove_task(gid)
             return await message.edit("Download cancelled by user ...")
@@ -117,10 +126,10 @@ async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # 
                     ),
                     t_file.progress_string(),
                 )
-                if is_file is None :
-                   info_msg = f"**Connections**: `{t_file.connections}`\n"
-                else :
-                   info_msg = f"**Info**: `[ P : {t_file.connections} || S : {t_file.num_seeders} ]`\n"
+                if is_file is None:
+                    info_msg = f"**Connections**: `{t_file.connections}`\n"
+                else:
+                    info_msg = f"**Info**: `[ P : {t_file.connections} || S : {t_file.num_seeders} ]`\n"
                 msg = (
                     f"`{prog_str}`\n"
                     f"**Name**: `{t_file.name}`\n"
@@ -139,14 +148,22 @@ async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # 
                     if _STATUS_AVAILABLE:
                         complete_task(gid)
                     if tg_upload:
-                        return await upload_path(message, Path(t_file.name), False)
+                        if _UPLOAD_OK and upload_path is not None:
+                            return await upload_path(message, Path(t_file.name), False)
+                        else:
+                            return await message.edit(
+                                f"**Name :** `{t_file.name}`\n"
+                                f"**Size :** `{t_file.total_length_string()}`\n"
+                                f"**Path :** `{os.path.join(t_file.dir, t_file.name)}`\n"
+                                "**Response :** __Download done. Upload plugin not available.__"
+                            )
                     else:
                         return await message.edit(
-                                     f"**Name :** `{t_file.name}`\n"
-                                     f"**Size :** `{t_file.total_length_string()}`\n"
-                                     f"**Path :** `{os.path.join(t_file.dir, t_file.name)}`\n"
-                                     "**Response :** __Successfully downloaded...__"
-                                    )
+                            f"**Name :** `{t_file.name}`\n"
+                            f"**Size :** `{t_file.total_length_string()}`\n"
+                            f"**Path :** `{os.path.join(t_file.dir, t_file.name)}`\n"
+                            "**Response :** __Successfully downloaded...__"
+                        )
                 await message.edit(f"`{msg}`")
             await sleep(Config.Dynamic.EDIT_SLEEP_TIMEOUT)
             await check_progress_for_dl(gid, message, previous, tg_upload)
@@ -161,8 +178,6 @@ async def check_progress_for_dl(gid, message: Message, previous, tg_upload):  # 
                 )
 
 
-
-
 @userge.on_cmd("dl", about={
     'header': "Download files to server from torrent or magnet using aria2p",
     'usage': "{tr}dl [url/magnet | reply to torrent file]",
@@ -175,12 +190,12 @@ async def t_url_download(message: Message):
     if '-t' in message.flags:
         tg_upload = True
     myoptions = {
-             "dir": os.path.join("/app", Config.Dynamic.DOWN_PATH)
-        }
-    if (message.reply_to_message and 
-           message.reply_to_message.document and 
-           message.reply_to_message.document.file_name.lower().endswith(
-            ('.torrent'))):
+        "dir": os.path.join("/app", Config.Dynamic.DOWN_PATH)
+    }
+    if (message.reply_to_message and
+            message.reply_to_message.document and
+            message.reply_to_message.document.file_name.lower().endswith(
+                ('.torrent'))):
         resource = message.reply_to_message
         resource = await message.client.download_media(
             message=resource,
@@ -191,20 +206,20 @@ async def t_url_download(message: Message):
         try:
             download = aria2p_client.add_torrent(
                 resource, uris=None, options=myoptions, position=None
-        )
+            )
         except Exception as e:
             return await message.err(str(e))
     elif message.input_str:
         resource = message.filtered_input_str
         is_url = True
         if resource.lower().startswith("http"):
-            try:  # Add URL Into Queue
+            try:
                 resource = [resource]
                 download = aria2p_client.add_uris(resource, options=myoptions)
             except Exception as e:
                 return await message.err(str(e))
         elif resource.lower().startswith("magnet:"):
-            try:  # Add Magnet Into Queue
+            try:
                 download = aria2p_client.add_magnet(resource, options=myoptions)
             except Exception as e:
                 return await message.err(str(e))
@@ -235,23 +250,24 @@ async def remove_all(message):
     except Exception as e:
         message = await message.err({str(e)})
         await sleep(Config.Dynamic.EDIT_SLEEP_TIMEOUT)
-    if not removed:  # If API returns False Try to Remove Through System Call.
+    if not removed:
         subprocess_run("aria2p remove-all")
     await message.edit("`Clearing on-going downloads... `")
     await sleep(1)
     await message.edit("`Successfully cleared all downloads.`")
-    
+
+
 @userge.on_cmd("acancel", about={
     'header': "Cancel a aria download.",
     'description': "Cancel a specific aria download",
     'usage': "{tr}acancel [gid]",
-    'examples':'{tr}acancel nf5bgi7g'})
+    'examples': '{tr}acancel nf5bgi7g'})
 async def remove_a_download(message):
     "Clear the aria Queue."
     g_id = message.input_str
     try:
         downloads = aria2p_client.get_download(g_id)
-    except:
+    except Exception:  # pylint: disable=broad-except
         await message.edit("GID not found ....")
         return
     file_name = downloads.name
@@ -260,11 +276,10 @@ async def remove_a_download(message):
 
 
 @userge.on_cmd("ashow", about={
-        "header": "Shows current aria progress.",
-        "description": "Shows progress of the on-going downloads.",
-        "usage": "{tr}ashow",
-    },
-)
+    "header": "Shows current aria progress.",
+    "description": "Shows progress of the on-going downloads.",
+    "usage": "{tr}ashow",
+})
 async def show_all(message):
     "Shows current aria progress of queue"
     downloads = aria2p_client.get_downloads()
@@ -272,21 +287,21 @@ async def show_all(message):
     for download in downloads:
         if str(download.status) != "complete":
             msg = (
-            msg
-            + "**File: **`"
-            + str(download.name)
-            + "`\n**Speed : **"
-            + str(download.download_speed_string())
-            + "\n**Progress : **"
-            + str(download.progress_string())
-            + "\n**Total Size : **"
-            + str(download.total_length_string())
-            + "\n**Status : **"
-            + str(download.status)
-            + "\n**ETA : **"
-            + str(download.eta_string())
-            + "\n**GID :**"
-            + f"`{str(download.gid)}`"
-            + "\n\n"
-        )
+                msg
+                + "**File: **`"
+                + str(download.name)
+                + "`\n**Speed : **"
+                + str(download.download_speed_string())
+                + "\n**Progress : **"
+                + str(download.progress_string())
+                + "\n**Total Size : **"
+                + str(download.total_length_string())
+                + "\n**Status : **"
+                + str(download.status)
+                + "\n**ETA : **"
+                + str(download.eta_string())
+                + "\n**GID :**"
+                + f"`{str(download.gid)}`"
+                + "\n\n"
+            )
     await message.edit("**On-going Downloads: **\n" + msg)
