@@ -21,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mediainfo \
     && rm -rf /var/lib/apt/lists/*
 
-# mkvtoolnix repo (bookworm) — proper keyring (no apt-key)
 RUN mkdir -p /etc/apt/keyrings \
     && wget -qO- https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg \
        | gpg --dearmor -o /etc/apt/keyrings/mkvtoolnix.gpg \
@@ -32,17 +31,21 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
-# Put everything in /usr/src/app (system location, not user-facing)
-WORKDIR /usr/src/app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
-COPY requirements.txt .
+RUN mkdir -p /app /bot \
+    && addgroup --system appgroup \
+    && adduser --system --ingroup appgroup ragu \
+    && chown -R ragu:appgroup /app /bot
+
+COPY . /app
+
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r /app/requirements.txt
 
-COPY userge ./userge
-RUN mkdir -p /home /downloads /app/logs
+WORKDIR /bot
 
-# Set working directory to /downloads - this is empty and user-facing
-WORKDIR /downloads
+USER ragu
 
-CMD ["python", "-m", "userge"]
+CMD ["sh", "-c", "python -m ragu"]
