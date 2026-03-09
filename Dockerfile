@@ -29,7 +29,7 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=cwhuntx/ffmpeg:latest /ffmpeg /usr/bin/
+COPY --from=cwhuntx/static-ffmpeg /ffmpeg /usr/bin/
 
 WORKDIR /app
 
