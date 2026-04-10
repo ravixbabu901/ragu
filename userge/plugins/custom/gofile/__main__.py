@@ -55,14 +55,14 @@ def _get_aria2():
 
 _GOFILE_UA = "Mozilla/5.0"
 _GOFILE_LANG = "en-US"
-_GOFILE_STATIC_SECRET = "gf2026x"
+GOFILE_STATIC_SECRET = os.environ.get("GOFILE_STATIC_SECRET", "")
 
 
 def _generate_x_website_token(bearer_token: str) -> str:
     time_bucket = str(math.floor(int(time.time()) / 14400))
     raw = (
         f"{_GOFILE_UA}::{_GOFILE_LANG}::{bearer_token}"
-        f"::{time_bucket}::{_GOFILE_STATIC_SECRET}"
+        f"::{time_bucket}::{GOFILE_STATIC_SECRET}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
