@@ -30,6 +30,7 @@ RUN mkdir -p /etc/apt/keyrings \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=cwhuntx/static-ffmpeg /ffmpeg /usr/bin/
+COPY --from=cwhuntx/static-ffmpeg /ffprobe /usr/bin/
 
 WORKDIR /app
 
