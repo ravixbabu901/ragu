@@ -29,6 +29,8 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
+RUN wget -qO- https://github.com/ginuerzh/gost/releases/download/v2.12.0/gost_2.12.0_linux_amd64.tar.gz | tar -xzf - -C /usr/local/bin/ gost
+
 COPY --from=cwhuntx/static-ffmpeg /ffmpeg /usr/bin/
 COPY --from=cwhuntx/static-ffmpeg /ffprobe /usr/bin/
 
