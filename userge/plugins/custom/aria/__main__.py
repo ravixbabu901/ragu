@@ -12,6 +12,20 @@ from requests import get
 from userge.utils import progress, humanbytes
 import aria2p
 
+import requests
+from json import JSONDecodeError as StdJSONDecodeError
+
+def safe_get_download(aria2p_client, gid):
+    try:
+        return aria2p_client.get_download(gid)
+    except (requests.exceptions.JSONDecodeError, StdJSONDecodeError) as e:
+        raise RuntimeError(
+            "aria2 RPC returned non-JSON response. "
+            "Likely wrong RPC endpoint or proxy intercepting aria2 RPC."
+        ) from e
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"aria2 RPC request failed: {e}") from e
+
 # upload_path depends on the upload plugin which requires stagger.
 # Import it lazily so aria loads even when upload plugin isn't available.
 try:
@@ -231,7 +245,11 @@ async def t_url_download(message: Message):
     await check_progress_for_dl(gid=gid, message=message, previous="", tg_upload=tg_upload)
     await sleep(Config.Dynamic.EDIT_SLEEP_TIMEOUT)
     if is_url:
-        file = aria2p_client.get_download(gid)
+        try:
+            file = safe_get_download(aria2p_client, gid)
+        except RuntimeError as e:
+            await message.err(str(e))
+            return
         if file.followed_by_ids:
             new_gid = await check_metadata(gid)
             await check_progress_for_dl(gid=new_gid, message=message, previous="", tg_upload=tg_upload)
