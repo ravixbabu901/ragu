@@ -37,6 +37,11 @@ from userge.utils.exceptions import ProcessCanceled
 from userge.utils.path_resolver import resolve_download_path
 from .. import gdrive
 
+import os
+os.environ["HTTP_PROXY"] = "http://127.0.0.1:8084"
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:8084"
+#os.environ["ALL_PROXY"] = "socks5h://127.0.0.1:1084"
+
 _CREDS: Optional[OAuth2Credentials] = None
 _AUTH_FLOW: Optional[OAuth2WebServerFlow] = None
 _PARENT_ID = ""
