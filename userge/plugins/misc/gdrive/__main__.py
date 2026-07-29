@@ -37,6 +37,9 @@ from userge.utils.exceptions import ProcessCanceled
 from userge.utils.path_resolver import resolve_download_path
 from .. import gdrive
 
+import httplib2
+from contextvars import ContextVar
+
 _CREDS: Optional[OAuth2Credentials] = None
 _AUTH_FLOW: Optional[OAuth2WebServerFlow] = None
 _PARENT_ID = ""
@@ -79,6 +82,8 @@ def _get_dl_session() -> _requests.Session:
         _DL_SESSION = s
     return _DL_SESSION
 
+# Per-command proxy for Google API client (no global env mutation)
+_GDRIVE_PROXY_URL: ContextVar[Optional[str]] = ContextVar("_GDRIVE_PROXY_URL", default=None)
 
 @userge.on_start
 async def _init() -> None:
@@ -134,7 +139,12 @@ def creds_dec(func):
 def _get_access_token() -> str:
     """Return a valid OAuth access token, refreshing if needed."""
     if _CREDS.access_token_expired:
-        _CREDS.refresh(Http())
+        proxy_url = _GDRIVE_PROXY_URL.get()
+        if proxy_url:
+            proxy_info = httplib2.ProxyInfo.from_url(proxy_url)
+            _CREDS.refresh(httplib2.Http(proxy_info=proxy_info))
+        else:
+            _CREDS.refresh(Http())
     return _CREDS.access_token
 
 
@@ -157,6 +167,12 @@ class _GDrive:
 
     @property
     def _service(self) -> object:
+        proxy_url = _GDRIVE_PROXY_URL.get()
+        if proxy_url:
+            proxy_info = httplib2.ProxyInfo.from_url(proxy_url)
+            http = httplib2.Http(proxy_info=proxy_info)
+            authed_http = _CREDS.authorize(http)
+            return build("drive", "v3", http=authed_http, cache_discovery=False)
         return build("drive", "v3", credentials=_CREDS, cache_discovery=False)
 
     @pool.run_in_thread
