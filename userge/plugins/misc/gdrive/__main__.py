@@ -22,6 +22,7 @@ from mimetypes import guess_type
 from typing import Optional
 from urllib.parse import quote, urlparse, parse_qs
 
+import socks
 import httplib2
 from contextvars import ContextVar
 from urllib.parse import urlparse
@@ -83,8 +84,6 @@ def _get_dl_session() -> _requests.Session:
         _DL_SESSION = s
     return _DL_SESSION
 
-# Per-command proxy for Google API client (no global env mutation)
-_GDRIVE_PROXY_URL: ContextVar[Optional[str]] = ContextVar("_GDRIVE_PROXY_URL", default=None)
 
 @userge.on_start
 async def _init() -> None:
