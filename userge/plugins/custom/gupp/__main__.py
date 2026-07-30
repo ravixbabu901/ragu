@@ -12,11 +12,7 @@ from userge.plugins.misc.gdrive.__main__ import Worker, _GDRIVE_PROXY_URL
 })
 async def gupp_(message: Message):
     """upload to gdrive with dedicated per-command proxy"""
-    proxy_url = message.client.get_config("GUP_PROXY") or message.client.get_config("GDRIVE_UPLOAD_PROXY")
-    if not proxy_url:
-        # fallback to env for compatibility
-        proxy_url = os.environ.get("GUP_PROXY") or os.environ.get("GDRIVE_UPLOAD_PROXY")
-
+    proxy_url = os.environ.get("GUP_PROXY") or os.environ.get("GDRIVE_UPLOAD_PROXY")
     if not proxy_url:
         await message.err("Set `GUP_PROXY` or `GDRIVE_UPLOAD_PROXY` to use `.gupp`.")
         return
