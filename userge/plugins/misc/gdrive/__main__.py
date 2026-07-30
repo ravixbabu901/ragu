@@ -137,13 +137,8 @@ def creds_dec(func):
 
 
 def _get_access_token() -> str:
-    """Return a valid OAuth access token, refreshing if needed."""
     if _CREDS.access_token_expired:
-        proxy_url = _GDRIVE_PROXY_URL.get()
-        if proxy_url:
-            _CREDS.refresh(_build_proxy_http(proxy_url))
-        else:
-            _CREDS.refresh(Http())
+        _CREDS.refresh(_build_http())
     return _CREDS.access_token
 
 _GDRIVE_PROXY_URL: ContextVar[Optional[str]] = ContextVar("_GDRIVE_PROXY_URL", default=None)
@@ -193,14 +188,11 @@ class _GDrive:
     def _finish(self) -> None:
         self._is_finished = True
 
-    @property
-    def _service(self) -> object:
-        proxy_url = _GDRIVE_PROXY_URL.get()
-        if proxy_url:
-            http = _build_proxy_http(proxy_url)
-            authed_http = _CREDS.authorize(http)
-            return build("drive", "v3", http=authed_http, cache_discovery=False)
-        return build("drive", "v3", credentials=_CREDS, cache_discovery=False)
+@property
+def _service(self) -> object:
+    http = _build_http()
+    authed_http = _CREDS.authorize(http)
+    return build("drive", "v3", http=authed_http, cache_discovery=False)
 
     @pool.run_in_thread
     def _search(self,
