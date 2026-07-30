@@ -148,31 +148,33 @@ def _get_access_token() -> str:
 
 _GDRIVE_PROXY_URL: ContextVar[Optional[str]] = ContextVar("_GDRIVE_PROXY_URL", default=None)
 
-
-def _build_proxy_http(proxy_url: str) -> httplib2.Http:
+def _proxy_info_from_url(proxy_url: str) -> httplib2.ProxyInfo:
     p = urlparse(proxy_url)
-    if not p.scheme or not p.hostname or not p.port:
-        raise ValueError(
-            "Invalid proxy URL. Use format: http://host:port or socks5://host:port"
-        )
+    if not p.hostname or not p.port:
+        raise ValueError("Invalid proxy url. Example: http://host:port or socks5://host:port")
 
-    # map scheme -> httplib2 proxy type
-    scheme = p.scheme.lower()
-    if scheme.startswith("socks5"):
-        proxy_type = 2  # socks.PROXY_TYPE_SOCKS5
-    elif scheme.startswith("socks4"):
-        proxy_type = 1  # socks.PROXY_TYPE_SOCKS4
+    scheme = (p.scheme or "http").lower()
+    if scheme in ("socks5", "socks5h"):
+        ptype = socks.PROXY_TYPE_SOCKS5
+    elif scheme in ("socks4", "socks4a"):
+        ptype = socks.PROXY_TYPE_SOCKS4
     else:
-        proxy_type = 3  # socks.PROXY_TYPE_HTTP
+        ptype = socks.PROXY_TYPE_HTTP
 
-    proxy_info = httplib2.ProxyInfo(
-        proxy_type=proxy_type,
+    return httplib2.ProxyInfo(
+        proxy_type=ptype,
         proxy_host=p.hostname,
         proxy_port=p.port,
         proxy_user=p.username,
         proxy_pass=p.password,
+        proxy_rdns=(scheme in ("socks5h", "socks4a")),
     )
-    return httplib2.Http(proxy_info=proxy_info)
+
+def _build_http() -> httplib2.Http:
+    proxy_url = _GDRIVE_PROXY_URL.get()
+    if proxy_url:
+        return httplib2.Http(proxy_info=_proxy_info_from_url(proxy_url), timeout=120)
+    return httplib2.Http(timeout=120)
 
 class _GDrive:
     """ GDrive Class For Search, Upload, Download, Copy, Move, Delete, EmptyTrash, ... """
