@@ -22,6 +22,10 @@ from mimetypes import guess_type
 from typing import Optional
 from urllib.parse import quote, urlparse, parse_qs
 
+import httplib2
+from contextvars import ContextVar
+from urllib.parse import urlparse
+
 import requests as _requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -36,9 +40,6 @@ from userge.utils import humanbytes, time_formatter, is_url
 from userge.utils.exceptions import ProcessCanceled
 from userge.utils.path_resolver import resolve_download_path
 from .. import gdrive
-
-import httplib2
-from contextvars import ContextVar
 
 _CREDS: Optional[OAuth2Credentials] = None
 _AUTH_FLOW: Optional[OAuth2WebServerFlow] = None
@@ -141,12 +142,38 @@ def _get_access_token() -> str:
     if _CREDS.access_token_expired:
         proxy_url = _GDRIVE_PROXY_URL.get()
         if proxy_url:
-            proxy_info = httplib2.ProxyInfo.from_url(proxy_url)
-            _CREDS.refresh(httplib2.Http(proxy_info=proxy_info))
+            _CREDS.refresh(_build_proxy_http(proxy_url))
         else:
             _CREDS.refresh(Http())
     return _CREDS.access_token
 
+_GDRIVE_PROXY_URL: ContextVar[Optional[str]] = ContextVar("_GDRIVE_PROXY_URL", default=None)
+
+
+def _build_proxy_http(proxy_url: str) -> httplib2.Http:
+    p = urlparse(proxy_url)
+    if not p.scheme or not p.hostname or not p.port:
+        raise ValueError(
+            "Invalid proxy URL. Use format: http://host:port or socks5://host:port"
+        )
+
+    # map scheme -> httplib2 proxy type
+    scheme = p.scheme.lower()
+    if scheme.startswith("socks5"):
+        proxy_type = 2  # socks.PROXY_TYPE_SOCKS5
+    elif scheme.startswith("socks4"):
+        proxy_type = 1  # socks.PROXY_TYPE_SOCKS4
+    else:
+        proxy_type = 3  # socks.PROXY_TYPE_HTTP
+
+    proxy_info = httplib2.ProxyInfo(
+        proxy_type=proxy_type,
+        proxy_host=p.hostname,
+        proxy_port=p.port,
+        proxy_user=p.username,
+        proxy_pass=p.password,
+    )
+    return httplib2.Http(proxy_info=proxy_info)
 
 class _GDrive:
     """ GDrive Class For Search, Upload, Download, Copy, Move, Delete, EmptyTrash, ... """
@@ -169,8 +196,7 @@ class _GDrive:
     def _service(self) -> object:
         proxy_url = _GDRIVE_PROXY_URL.get()
         if proxy_url:
-            proxy_info = httplib2.ProxyInfo.from_url(proxy_url)
-            http = httplib2.Http(proxy_info=proxy_info)
+            http = _build_proxy_http(proxy_url)
             authed_http = _CREDS.authorize(http)
             return build("drive", "v3", http=authed_http, cache_discovery=False)
         return build("drive", "v3", credentials=_CREDS, cache_discovery=False)
