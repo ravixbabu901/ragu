@@ -22,6 +22,11 @@ from mimetypes import guess_type
 from typing import Optional
 from urllib.parse import quote, urlparse, parse_qs
 
+import socks
+import httplib2
+from contextvars import ContextVar
+from urllib.parse import urlparse
+
 import requests as _requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -132,11 +137,39 @@ def creds_dec(func):
 
 
 def _get_access_token() -> str:
-    """Return a valid OAuth access token, refreshing if needed."""
     if _CREDS.access_token_expired:
-        _CREDS.refresh(Http())
+        _CREDS.refresh(_build_http())
     return _CREDS.access_token
 
+_GDRIVE_PROXY_URL: ContextVar[Optional[str]] = ContextVar("_GDRIVE_PROXY_URL", default=None)
+
+def _proxy_info_from_url(proxy_url: str) -> httplib2.ProxyInfo:
+    p = urlparse(proxy_url)
+    if not p.hostname or not p.port:
+        raise ValueError("Invalid proxy url. Example: http://host:port or socks5://host:port")
+
+    scheme = (p.scheme or "http").lower()
+    if scheme in ("socks5", "socks5h"):
+        ptype = socks.PROXY_TYPE_SOCKS5
+    elif scheme in ("socks4", "socks4a"):
+        ptype = socks.PROXY_TYPE_SOCKS4
+    else:
+        ptype = socks.PROXY_TYPE_HTTP
+
+    return httplib2.ProxyInfo(
+        proxy_type=ptype,
+        proxy_host=p.hostname,
+        proxy_port=p.port,
+        proxy_user=p.username,
+        proxy_pass=p.password,
+        proxy_rdns=(scheme in ("socks5h", "socks4a")),
+    )
+
+def _build_http() -> httplib2.Http:
+    proxy_url = _GDRIVE_PROXY_URL.get()
+    if proxy_url:
+        return httplib2.Http(proxy_info=_proxy_info_from_url(proxy_url), timeout=120)
+    return httplib2.Http(timeout=120)
 
 class _GDrive:
     """ GDrive Class For Search, Upload, Download, Copy, Move, Delete, EmptyTrash, ... """
@@ -155,9 +188,11 @@ class _GDrive:
     def _finish(self) -> None:
         self._is_finished = True
 
-    @property
-    def _service(self) -> object:
-        return build("drive", "v3", credentials=_CREDS, cache_discovery=False)
+@property
+def _service(self) -> object:
+    http = _build_http()
+    authed_http = _CREDS.authorize(http)
+    return build("drive", "v3", http=authed_http, cache_discovery=False)
 
     @pool.run_in_thread
     def _search(self,
